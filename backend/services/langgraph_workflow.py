@@ -1,3 +1,8 @@
+import sys
+if sys.platform == 'win32':
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
 """
 GuppShupp Conversational AI Workflow - LangGraph-based Agentic System
 ========================================================================
@@ -303,10 +308,21 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
 
     try:
         # Start both tasks in parallel
-        transcription_task = transcribe_audio(state["audio_path"], state["request_id"])
-        prosody_task = extract_prosody_features(
-            state["audio_path"], state["request_id"]
-        )
+        audio_path = str(state["audio_path"])  # Force string
+        
+        # ✅ ADD FILE EXISTENCE CHECK
+        from pathlib import Path
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_path}. "
+                f"File may have been deleted prematurely."
+            )
+        
+        logger.info(f"[DEBUG] Audio file verified: {audio_path} (exists: {audio_file.exists()})")
+        
+        transcription_task = transcribe_audio(audio_path, state["request_id"])
+        prosody_task = extract_prosody_features(audio_path, state["request_id"])
 
         # Wait for both to complete
         transcription, prosody_features = await asyncio.gather(
@@ -330,8 +346,8 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         # Log results
         if transcription:
             logger.info(
-                f"[PHASE 1] ✓ Transcription: {transcription.text[:100]}... "
-                f"({transcription.word_count} words, {transcription.processing_time_ms}ms)"
+                f"[PHASE 1] ✓ Transcription: {transcription.get('text', '')[:100]}... "
+                f"({transcription.get('word_count', 0)} words, {transcription.get('processing_time_ms', 0)}ms)"
             )
         if prosody_features:
             logger.info(
@@ -346,7 +362,7 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         # Return state updates
         # ✅ Convert ProsodyResult to dict for msgpack serialization (checkpointer requirement)
         return {
-            "transcription": transcription,
+            "transcription": sanitize_for_state(transcription),
             "prosody_features": sanitize_for_state(prosody_features),
             "audio_analysis_error": transcription_error or prosody_error,
             "audio_analysis_time_ms": elapsed_ms,
@@ -389,8 +405,8 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
             long_term_memories = []
             episodic_memories = []
         else:
-            # Parallel tasks: memory retrieval using semantic search
-            query_text = state["transcription"].text
+            # ⚠️ transcription is now a dict after sanitize_for_state()
+            query_text = state["transcription"].get("text", "")
 
             memory_task = _workflow_services.memory_service.retrieve_memories_async(
                 db=_workflow_services.db_session,
@@ -417,15 +433,32 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
                 state["conversation_id"],
             )
 
+            # ⚠️ CRITICAL FIX: Execute database operations SEQUENTIALLY
+            # SQLAlchemy sessions are NOT thread-safe for concurrent use
+            # The previous asyncio.gather caused "isce" error:
+            # "This session is provisioning a new connection; concurrent operations are not permitted"
+            
+            # Step 1: Get memories (uses db_session)
             try:
-                memories_list, short_term_ctx, conversation = await asyncio.gather(
-                    memory_task, session_context_task, conversation_task
-                )
+                memories_list = await memory_task
             except Exception as e:
-                logger.warning(f"[PHASE 2] Context retrieval error: {e}")
+                logger.warning(f"[PHASE 2] Memory retrieval failed: {e}")
                 memories_list = []
+            
+            # Step 2: Get session context (uses db_session)
+            try:
+                short_term_ctx = await session_context_task
+            except Exception as e:
+                logger.warning(f"[PHASE 2] Session context failed: {e}")
                 short_term_ctx = []
+            
+            # Step 3: Get or create conversation (uses db_session)
+            try:
+                conversation = await conversation_task
+            except Exception as e:
+                logger.warning(f"[PHASE 2] Conversation task failed: {e}")
                 conversation = None
+
 
             # Split memories into long-term and episodic
             long_term_memories = [
@@ -498,10 +531,10 @@ async def phase_3_llm_generation_with_guardrails(
         session_context["current_tts_speaker"] = state.get("current_tts_speaker")
         session_context["voice_preferences"] = state.get("voice_preferences", {})
         
-        # Call Gemini LLM - it handles safety internally with comprehensive guardrails
+        # ⚠️ transcription is now a dict after sanitize_for_state()
         llm_response = await _workflow_services.llm_service.analyze_and_respond_async(
-            transcript=state["transcription"].text if state["transcription"] else "",
-            language=state["transcription"].language if state["transcription"] else "en",
+            transcript=state["transcription"].get("text", "") if state["transcription"] else "",
+            language=state["transcription"].get("language", "en") if state["transcription"] else "en",
             acoustic_features=acoustic_features,
             short_term_context=state["short_term_context"],
             long_term_memories=state["long_term_memories"],
@@ -622,7 +655,10 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
         )
 
         return {
-            "tts_response": tts_response,
+            # ⚠️ CRITICAL: sanitize_for_state converts TTSResponse to dict
+            # This is required because TTSResponse contains numpy.ndarray
+            # which cannot be serialized by LangGraph's MsgPack checkpointer
+            "tts_response": sanitize_for_state(tts_response),
             "tts_error": None,
             "tts_time_ms": elapsed_ms,
             "messages": [
@@ -632,6 +668,7 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
                 )
             ],
         }
+
 
     except Exception as e:
         logger.error(f"[PHASE 4] TTS generation error: {e}", exc_info=True)
@@ -880,8 +917,8 @@ def _store_conversation(state: WorkflowState) -> bool:
             logger.warning("Missing LLM response or transcription - skipping storage")
             return False
 
-        # Generate embedding for semantic search using IndicBERT
-        user_text = state["transcription"].text
+        # ⚠️ transcription is now a dict after sanitize_for_state()
+        user_text = state["transcription"].get("text", "")
         logger.info(f"Generating IndicBERT embedding for: {user_text[:50]}...")
         embedding = _workflow_services.memory_service.embed_text(user_text, use_cache=False)
         embedding_list = embedding.tolist()  # Convert numpy to list for pgvector
@@ -895,11 +932,11 @@ def _store_conversation(state: WorkflowState) -> bool:
             user_input_text=user_text,
             ai_response_text=state["llm_response"].response_text,
             
-            # Language detection
-            detected_language=state["transcription"].language if state["transcription"] else "en",
+            # Language detection - ⚠️ transcription is now a dict
+            detected_language=state["transcription"].get("language", "en") if state["transcription"] else "en",
             response_language=state["llm_response"].response_language,
-            is_code_mixed=state["transcription"].is_code_mixed if state["transcription"] else False,
-            code_mix_languages=state["transcription"].detected_languages if state["transcription"] else None,
+            is_code_mixed=state["transcription"].get("is_code_mixed", False) if state["transcription"] else False,
+            code_mix_languages=state["transcription"].get("detected_languages") if state["transcription"] else None,
             
             # Emotion & sentiment (from Gemini LLM)
             detected_emotion=state["llm_response"].detected_emotion,
@@ -922,7 +959,7 @@ def _store_conversation(state: WorkflowState) -> bool:
 
             if state["prosody_features"]
             else 0,
-            audio_file_path=state["audio_path"],
+            audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
             response_audio_path=None,  # Will be updated after TTS
             
             # TTS generation details
@@ -987,7 +1024,7 @@ def _store_memories(state: WorkflowState) -> bool:
 
 async def execute_workflow(
     workflow_input: WorkflowInput,
-    db_session: Session,
+    db_session: Session = None,
 ) -> Dict[str, Any]:
     """
     Execute the complete conversation workflow.
@@ -997,71 +1034,80 @@ async def execute_workflow(
     
     Args:
         workflow_input: User audio + metadata
-        db_session: Database session for persistence
+        db_session: Optional database session (will create one if not provided)
     
     Returns:
         Complete workflow output with all phases and results
     """
-    # Initialize services on first call
-    if not _workflow_services.llm_service:
-        await _workflow_services.initialize_async(db_session)
-
-    # Build initial state
-    initial_state: WorkflowState = {
-        "audio_path": workflow_input["audio_path"],
-        "user_id": workflow_input["user_id"],
-        "session_id": workflow_input["session_id"],
-        "conversation_id": workflow_input.get("conversation_id"),
-        "session_context": workflow_input.get(
-            "session_context",
-            {
-                "current_tts_speaker": None,  # Will be set by LLM
-                "session_language": "auto",
-                "voice_preferences": {},
-            },
-        ),
-        "request_id": workflow_input.get("request_id") or f"req_{int(time.time() * 1000)}",
-        # Phase placeholders
-        "transcription": None,
-        "prosody_features": None,
-        "audio_analysis_error": None,
-        "audio_analysis_time_ms": 0,
-        "long_term_memories": [],
-        "episodic_memories": [],
-        "short_term_context": [],
-        "session_metadata": {},
-        "context_prep_error": None,
-        "context_prep_time_ms": 0,
-        "llm_response": None,
-        "llm_error": None,
-        "llm_time_ms": 0,
-        "safety_flags": None,
-        "safety_passed": False,
-        "safety_action": "continue",
-        "tts_response": None,
-        "tts_error": None,
-        "tts_time_ms": 0,
-        # TTS Speaker Tracking (for session persistence)
-        "current_tts_speaker": workflow_input.get("session_context", {}).get("current_tts_speaker"),
-        "voice_preferences": workflow_input.get("session_context", {}).get("voice_preferences", {}),
-        "conversation_stored": False,
-        "memories_stored": False,
-        "db_error": None,
-        "db_time_ms": 0,
-        "messages": [],
-        "total_time_ms": 0,
-        "workflow_status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-    }
-
-    # Execute workflow with proper checkpointer based on environment
-    workflow_start = time.time()
-
+    # Create our own session if not provided
+    from backend.database.database import SessionLocal
+    
+    own_session = False
+    if db_session is None:
+        db_session = SessionLocal()
+        own_session = True
+    
     try:
+        # Initialize services on first call
+        if not _workflow_services.llm_service:
+            await _workflow_services.initialize_async(db_session)
+
+        # Build initial state
+        initial_state: WorkflowState = {
+            "audio_path": str(workflow_input["audio_path"]),
+            "user_id": workflow_input["user_id"],
+            "session_id": workflow_input["session_id"],
+            "conversation_id": workflow_input.get("conversation_id"),
+            "session_context": workflow_input.get(
+                "session_context",
+                {
+                    "current_tts_speaker": None,  # Will be set by LLM
+                    "session_language": "auto",
+                    "voice_preferences": {},
+                },
+            ),
+            "request_id": workflow_input.get("request_id") or f"req_{int(time.time() * 1000)}",
+            # Phase placeholders
+            "transcription": None,
+            "prosody_features": None,
+            "audio_analysis_error": None,
+            "audio_analysis_time_ms": 0,
+            "long_term_memories": [],
+            "episodic_memories": [],
+            "short_term_context": [],
+            "session_metadata": {},
+            "context_prep_error": None,
+            "context_prep_time_ms": 0,
+            "llm_response": None,
+            "llm_error": None,
+            "llm_time_ms": 0,
+            "safety_flags": None,
+            "safety_passed": False,
+            "safety_action": "continue",
+            "tts_response": None,
+            "tts_error": None,
+            "tts_time_ms": 0,
+            # TTS Speaker Tracking (for session persistence)
+            "current_tts_speaker": workflow_input.get("session_context", {}).get("current_tts_speaker"),
+            "voice_preferences": workflow_input.get("session_context", {}).get("voice_preferences", {}),
+            "conversation_stored": False,
+            "memories_stored": False,
+            "db_error": None,
+            "db_time_ms": 0,
+            "messages": [],
+            "total_time_ms": 0,
+            "workflow_status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+
+        # Execute workflow with proper checkpointer based on environment
+        workflow_start = time.time()
+
         logger.info(
             f"Executing workflow {initial_state['request_id']} for user {workflow_input['user_id']}"
         )
+
 
         # Per LangGraph docs: Use context manager for PostgresSaver
         if config.application.environment == "production":
@@ -1163,7 +1209,14 @@ async def execute_workflow(
         initial_state["workflow_status"] = "failed"
         initial_state["completed_at"] = datetime.now(timezone.utc).isoformat()
         return initial_state
-
+    
+    finally:
+        # Close session if we created it ourselves
+        if own_session and db_session:
+            try:
+                db_session.close()
+            except Exception as e:
+                logger.warning(f"Error closing workflow session: {e}")
 
 # ============================================================================
 # CLI Testing
