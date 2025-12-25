@@ -18,7 +18,7 @@ The Parler model already knows which speakers belong to which languages.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 import os
 import io
@@ -30,7 +30,13 @@ import torch
 import numpy as np
 import soundfile as sf
 from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
+
+# Minimal compatibility patch for transformers 4.46+
+from parler_tts.modeling_parler_tts import ParlerTTSForConditionalGeneration
+
+if not hasattr(ParlerTTSForConditionalGeneration, "_validate_model_kwargs"):
+    ParlerTTSForConditionalGeneration._validate_model_kwargs = lambda self, kwargs: kwargs
 
 try:
     from dotenv import load_dotenv
@@ -52,7 +58,7 @@ class TTSConfig:
     Configuration for Indic Parler TTS.
     """
     # RECOMMENDATION: use the fine-tuned model, not the bare pretrained
-    model_name: str = "ai4bharat/indic-parler-tts-pretrained"
+    model_name: str = "ai4bharat/indic-parler-t"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     sampling_rate: int = 44100
     cache_enabled: bool = True
@@ -104,23 +110,28 @@ class ParlerTTSService:
         self.device = torch.device(self.config.device)
 
         logger.info(f"Initializing ParlerTTSService on device={self.config.device}")
-
+        
         # Optional: Hugging Face token from env
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
 
         try:
-            # Load model
+            # STEP 1: LOAD MODEL DIRECTLY (Do not use AutoConfig)
             logger.info(f"Loading Indic Parler TTS model: {self.config.model_name}")
+            
+            # We pass parameters directly to the model loader
             self.model = ParlerTTSForConditionalGeneration.from_pretrained(
                 self.config.model_name,
                 token=hf_token,
+                torch_dtype=torch.float16,   # Keep this for VRAM savings
             ).to(self.device)
-
-            # Load tokenizers
+            
+            # STEP 2: LOAD TOKENIZERS
+            # We get the text encoder path from the LOADED model, exactly like your working script
             self.description_tokenizer = AutoTokenizer.from_pretrained(
                 self.model.config.text_encoder._name_or_path,
                 token=hf_token,
             )
+            
             self.text_tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model_name,
                 token=hf_token,
@@ -134,7 +145,7 @@ class ParlerTTSService:
         except Exception as e:
             logger.error(f"Failed to initialize ParlerTTSService: {e}", exc_info=True)
             raise
-
+        
     # --------------------------------------------------------------------- #
     # PUBLIC API
     # --------------------------------------------------------------------- #

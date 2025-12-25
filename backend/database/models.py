@@ -27,6 +27,12 @@ class User(Base):
     username = Column(String(255), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=True, index=True)
     
+    # Authentication fields (added for FastAPI backend)
+    password_hash = Column(String(255), nullable=True)  # bcrypt hash, nullable for legacy users
+    session_token = Column(String(64), nullable=True, index=True)  # UUID session token
+    display_name = Column(String(100), nullable=True)  # Optional display name
+    last_login = Column(TIMESTAMP, nullable=True)  # Track last login time
+    
     # Language preferences
     preferred_language = Column(String(10), default='hi')
     
@@ -39,6 +45,7 @@ class User(Base):
     
     # Account status
     is_active = Column(Boolean, default=True)
+
     
     # Relationships
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")

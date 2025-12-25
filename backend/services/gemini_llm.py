@@ -72,8 +72,12 @@ class GeminiLLMResponse:
     intent_confidence: float  # 0.0 to 1.0
     
     # TTS integration
-    tts_style_prompt: str
+    tts_style_prompt: str  # MUST start with "speaks" (no speaker name)
     tts_speaker: str  # e.g., "Rohit" for Hindi, "Thoma" for English
+    
+    # Voice preference tracking (NEW)
+    voice_change_requested: bool  # True if user wants voice change
+    preferred_speaker_gender: str  # "male", "female", or "any"
     
     # Memory operations (proposed by LLM)
     memory_updates: List[MemoryUpdate]
@@ -96,6 +100,8 @@ class GeminiLLMResponse:
             "intent_confidence": self.intent_confidence,
             "tts_prompt": self.tts_style_prompt,
             "tts_speaker": self.tts_speaker,
+            "voice_change_requested": self.voice_change_requested,
+            "preferred_speaker_gender": self.preferred_speaker_gender,
             "memory_updates": [m.to_dict() for m in self.memory_updates],
             "safety_flags": self.safety_flags.to_dict(),
             "response_generation_time_ms": self.generation_time_ms,
@@ -115,7 +121,7 @@ GEMINI_RESPONSE_SCHEMA = {
         },
         "response_language": {
             "type": "string",
-            "description": "Language code (e.g., 'hi', 'en', 'hi-en' for code-mixing)"
+            "description": "Best response language code (validate from transcript, don't blindly trust ASR). Examples: 'hi', 'en', 'ta', 'bn', 'hi-en' for code-mixing"
         },
         "detected_emotion": {
             "type": "string",
@@ -143,15 +149,24 @@ GEMINI_RESPONSE_SCHEMA = {
         },
         "tts_style_prompt": {
             "type": "string",
-            "description": "Emotion-aligned TTS description for Indic Parler (Aarav personality, tone)"
+            "description": "TTS description MUST start with 'speaks' (lowercase, no speaker name). Describe pace, pitch, tone, emotion, environment. Example: 'speaks at a moderate pace with a warm, empathetic tone in a close-sounding environment with clear audio quality.'"
         },
         "tts_speaker": {
             "type": "string",
-            "description": "Recommended speaker (e.g., 'Rohit' for Hindi, 'Thoma' for English)"
+            "description": "Speaker name from available speakers for response_language. Consider: 1) Current session speaker if same language, 2) User's gender preference, 3) Voice change request. Examples: 'Rohit', 'Divya', 'Thoma', 'Mary'"
+        },
+        "voice_change_requested": {
+            "type": "boolean",
+            "description": "True if user expressed dislike for current voice or requested change (e.g., 'change your voice', 'I don't like this voice', 'talk differently')"
+        },
+        "preferred_speaker_gender": {
+            "type": "string",
+            "enum": ["male", "female", "any"],
+            "description": "User's speaker gender preference if mentioned (e.g., 'I want to talk to a girl' -> 'female'), otherwise 'any'"
         },
         "memory_updates": {
             "type": "array",
-            "description": "Proposed memories to extract and store",
+            "description": "Proposed memories to extract and store. IMPORTANT: Extract facts, preferences, emotional patterns, voice preferences",
             "items": {
                 "type": "object",
                 "properties": {
@@ -165,7 +180,7 @@ GEMINI_RESPONSE_SCHEMA = {
                     },
                     "category": {
                         "type": "string",
-                        "description": "Memory category (work_study, relationships, health, emotional, etc.)"
+                        "description": "Memory category: personal_info, preferences, relationships, work_study, health, emotional, voice_preference, etc."
                     },
                     "importance": {
                         "type": "number",
@@ -198,28 +213,199 @@ GEMINI_RESPONSE_SCHEMA = {
     "required": [
         "response_text", "response_language", "detected_emotion", "emotion_confidence",
         "sentiment", "detected_intent", "intent_confidence", "tts_style_prompt",
-        "tts_speaker", "memory_updates", "safety_flags"
+        "tts_speaker", "voice_change_requested", "preferred_speaker_gender",
+        "memory_updates", "safety_flags"
     ]
 }
 
 
 # ============================================================================
-# INDIC PARLER TTS SPEAKER MAPPING (FROM SPEC)
+# INDIC PARLER TTS SPEAKER MAPPING (COMPLETE - ALL 18 LANGUAGES)
+# Source: https://huggingface.co/ai4bharat/indic-parler-tts
 # ============================================================================
 
 TTS_SPEAKER_MAP = {
-    "hi": {"default": "Rohit", "female": "Divya"},
-    "en": {"default": "Thoma", "female": "Mary"},
-    "ta": {"default": "Prakash", "female": "Jaya"},
-    "te": {"default": "Prakash", "female": "Lalitha"},
-    "kn": {"default": "Suresh", "female": "Anu"},
-    "ml": {"default": "Harish", "female": "Anjali"},
-    "bn": {"default": "Arjun", "female": "Aditi"},
-    "mr": {"default": "Sanjay", "female": "Sunita"},
-    "gu": {"default": "Yash", "female": "Neha"},
-    "pa": {"default": "Divjot", "female": "Gurpreet"},
-    "or": {"default": "Manas", "female": "Debjani"},
+    # ===== ASSAMESE (as) =====
+    "as": {
+        "all": ["Amit", "Sita", "Poonam", "Rakesh"],
+        "male": ["Amit", "Rakesh"],
+        "female": ["Sita", "Poonam"],
+        "recommended": ["Amit", "Sita"],
+    },
+    # ===== BENGALI (bn) =====
+    "bn": {
+        "all": ["Arjun", "Aditi", "Tapan", "Rashmi", "Arnav", "Riya"],
+        "male": ["Arjun", "Tapan", "Arnav"],
+        "female": ["Aditi", "Rashmi", "Riya"],
+        "recommended": ["Arjun", "Aditi"],
+    },
+    # ===== BODO (brx) =====
+    "brx": {
+        "all": ["Bikram", "Maya", "Kalpana"],
+        "male": ["Bikram"],
+        "female": ["Maya", "Kalpana"],
+        "recommended": ["Bikram", "Maya"],
+    },
+    # ===== CHHATTISGARHI (hne) =====
+    "hne": {
+        "all": ["Bhanu", "Champa"],
+        "male": ["Bhanu"],
+        "female": ["Champa"],
+        "recommended": ["Bhanu", "Champa"],
+    },
+    # ===== DOGRI (doi) =====
+    "doi": {
+        "all": ["Karan"],
+        "male": ["Karan"],
+        "female": [],
+        "recommended": ["Karan"],
+    },
+    # ===== ENGLISH (en) =====
+    "en": {
+        "all": ["Thoma", "Mary", "Swapna", "Dinesh", "Meera", "Jatin", "Aakash", 
+                "Sneha", "Kabir", "Tisha", "Chingkhei", "Thoiba", "Priya", "Tarun", 
+                "Gauri", "Nisha", "Raghav", "Kavya", "Ravi", "Vikas", "Riya"],
+        "male": ["Thoma", "Dinesh", "Jatin", "Aakash", "Kabir", "Thoiba", 
+                 "Tarun", "Raghav", "Ravi", "Vikas"],
+        "female": ["Mary", "Swapna", "Meera", "Sneha", "Tisha", "Chingkhei", 
+                   "Priya", "Gauri", "Nisha", "Kavya", "Riya"],
+        "recommended": ["Thoma", "Mary"],
+    },
+    # ===== GUJARATI (gu) =====
+    "gu": {
+        "all": ["Yash", "Neha"],
+        "male": ["Yash"],
+        "female": ["Neha"],
+        "recommended": ["Yash", "Neha"],
+    },
+    # ===== HINDI (hi) =====
+    "hi": {
+        "all": ["Rohit", "Divya", "Aman", "Rani"],
+        "male": ["Rohit", "Aman"],
+        "female": ["Divya", "Rani"],
+        "recommended": ["Rohit", "Divya"],
+    },
+    # ===== KANNADA (kn) =====
+    "kn": {
+        "all": ["Suresh", "Anu", "Chetan", "Vidya"],
+        "male": ["Suresh", "Chetan"],
+        "female": ["Anu", "Vidya"],
+        "recommended": ["Suresh", "Anu"],
+    },
+    # ===== MALAYALAM (ml) =====
+    "ml": {
+        "all": ["Anjali", "Anju", "Harish"],
+        "male": ["Harish"],
+        "female": ["Anjali", "Anju"],
+        "recommended": ["Anjali", "Harish"],
+    },
+    # ===== MANIPURI / MEITEI (mni) =====
+    "mni": {
+        "all": ["Laishram", "Ranjit"],
+        "male": ["Laishram", "Ranjit"],
+        "female": [],
+        "recommended": ["Laishram", "Ranjit"],
+    },
+    # ===== MARATHI (mr) =====
+    "mr": {
+        "all": ["Sanjay", "Sunita", "Nikhil", "Radha", "Varun", "Isha"],
+        "male": ["Sanjay", "Nikhil", "Varun"],
+        "female": ["Sunita", "Radha", "Isha"],
+        "recommended": ["Sanjay", "Sunita"],
+    },
+    # ===== NEPALI (ne) =====
+    "ne": {
+        "all": ["Amrita"],
+        "male": [],
+        "female": ["Amrita"],
+        "recommended": ["Amrita"],
+    },
+    # ===== ODIA (or) =====
+    "or": {
+        "all": ["Manas", "Debjani"],
+        "male": ["Manas"],
+        "female": ["Debjani"],
+        "recommended": ["Manas", "Debjani"],
+    },
+    # ===== PUNJABI (pa) =====
+    "pa": {
+        "all": ["Divjot", "Gurpreet"],
+        "male": ["Divjot"],
+        "female": ["Gurpreet"],
+        "recommended": ["Divjot", "Gurpreet"],
+    },
+    # ===== SANSKRIT (sa) =====
+    "sa": {
+        "all": ["Aryan"],
+        "male": ["Aryan"],
+        "female": [],
+        "recommended": ["Aryan"],
+    },
+    # ===== TAMIL (ta) =====
+    "ta": {
+        "all": ["Kavitha", "Jaya"],
+        "male": [],
+        "female": ["Kavitha", "Jaya"],
+        "recommended": ["Jaya"],
+    },
+    # ===== TELUGU (te) =====
+    "te": {
+        "all": ["Prakash", "Lalitha", "Kiran"],
+        "male": ["Prakash", "Kiran"],
+        "female": ["Lalitha"],
+        "recommended": ["Prakash", "Lalitha"],
+    },
 }
+
+
+def get_speaker_for_language(
+    language: str,
+    gender_preference: str = "any",
+    current_speaker: str = None,
+    avoid_speakers: list = None,
+) -> str:
+    """
+    Get appropriate TTS speaker based on language and preferences.
+    
+    Args:
+        language: ISO language code (hi, en, ta, etc.)
+        gender_preference: "male", "female", or "any"
+        current_speaker: Current session speaker (to maintain consistency)
+        avoid_speakers: List of speakers user doesn't want
+        
+    Returns:
+        Speaker name string
+    """
+    import random
+    
+    # Normalize language code
+    lang = language.lower().split("-")[0]  # "hi-en" -> "hi"
+    
+    # Get language speakers or fallback to Hindi
+    lang_speakers = TTS_SPEAKER_MAP.get(lang, TTS_SPEAKER_MAP.get("hi"))
+    
+    # If current speaker is valid for this language, keep it
+    if current_speaker and current_speaker in lang_speakers["all"]:
+        if not avoid_speakers or current_speaker not in avoid_speakers:
+            return current_speaker
+    
+    # Get candidates based on gender preference
+    if gender_preference == "male" and lang_speakers["male"]:
+        candidates = lang_speakers["male"]
+    elif gender_preference == "female" and lang_speakers["female"]:
+        candidates = lang_speakers["female"]
+    else:
+        candidates = lang_speakers["recommended"] or lang_speakers["all"]
+    
+    # Remove avoided speakers
+    if avoid_speakers:
+        candidates = [s for s in candidates if s not in avoid_speakers]
+    
+    # Fallback if no candidates left
+    if not candidates:
+        candidates = lang_speakers["all"]
+    
+    return random.choice(candidates) if candidates else "Rohit"
 
 
 # ============================================================================
@@ -483,7 +669,7 @@ class GeminiLLMService:
         short_term_context: List[Dict[str, Any]],
         long_term_memories: List[Dict[str, Any]],
         episodic_memories: List[Dict[str, Any]],
-        character_profile: Dict[str, Any],
+        session_context: Dict[str, Any],  # Contains: current_tts_speaker, session_language, voice_preferences
         safety_context: Dict[str, Any],
         *,
         temperature: float = 0.7,
@@ -521,13 +707,13 @@ class GeminiLLMService:
             short_term_context=short_term_context,
             long_term_memories=long_term_memories,
             episodic_memories=episodic_memories,
-            character_profile=character_profile,
+            session_context=session_context,
             safety_context=safety_context,
         )
 
         # Build Gemini config with structured JSON output
         config = types.GenerateContentConfig(
-            system_instruction=self._build_system_instruction(character_profile),
+            system_instruction=self._build_system_instruction(session_context),
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             response_mime_type="application/json",
@@ -573,6 +759,7 @@ class GeminiLLMService:
             "response_text", "response_language", "detected_emotion", 
             "emotion_confidence", "sentiment", "detected_intent",
             "intent_confidence", "tts_style_prompt", "tts_speaker",
+            "voice_change_requested", "preferred_speaker_gender",
             "memory_updates", "safety_flags"
         ]
         return all(key in response_dict for key in required_keys)
@@ -586,7 +773,7 @@ class GeminiLLMService:
         short_term_context: List[Dict[str, Any]],
         long_term_memories: List[Dict[str, Any]],
         episodic_memories: List[Dict[str, Any]],
-        character_profile: Dict[str, Any],
+        session_context: Dict[str, Any],  # Contains: current_tts_speaker, session_language, voice_preferences
         safety_context: Dict[str, Any],
         *,
         temperature: float = 0.7,
@@ -608,12 +795,12 @@ class GeminiLLMService:
             short_term_context=short_term_context,
             long_term_memories=long_term_memories,
             episodic_memories=episodic_memories,
-            character_profile=character_profile,
+            session_context=session_context,
             safety_context=safety_context,
         )
 
         config = types.GenerateContentConfig(
-            system_instruction=self._build_system_instruction(character_profile),
+            system_instruction=self._build_system_instruction(session_context),
             temperature=temperature,
             max_output_tokens=max_output_tokens,
             response_mime_type="application/json",
@@ -677,52 +864,121 @@ class GeminiLLMService:
     # PROMPT ENGINEERING & SYSTEM INSTRUCTIONS
     # ========================================================================
 
-    def _build_system_instruction(self, character_profile: Dict[str, Any]) -> str:
+    def _build_system_instruction(self, session_context: Dict[str, Any]) -> str:
         """
-        Build system instruction for Aarav personality + safety constraints.
+        Build system instruction for Guppu AI companion.
+        Includes dynamic TTS speaker selection rules.
         
-        SDK Reference: system_instruction in GenerateContentConfig
-        https://googleapis.github.io/python-genai#configuring-generation
+        Args:
+            session_context: Contains current_tts_speaker, available_speakers, user preferences
         """
-        name = character_profile.get("name", "Aarav")
-        background = character_profile.get("background", "")
-        traits = character_profile.get("traits", [])
-        speech_style = character_profile.get("speech_style", "")
-
-        traits_str = ", ".join(traits) if traits else "empathetic, thoughtful, culturally aware"
+        current_speaker = session_context.get("current_tts_speaker", None)
+        session_lang = session_context.get("session_language", "auto")
+        voice_prefs = session_context.get("voice_preferences", {})
         
-        return f"""You are {name}, an emotionally intelligent AI voice assistant designed for Indian language speakers.
+        # Build available speakers info
+        speakers_info = json.dumps(TTS_SPEAKER_MAP, indent=2, ensure_ascii=False)
+        
+        return f"""You are GUPPU (गप्पू), an emotionally intelligent AI voice companion for Indian youth.
 
-PERSONALITY & BACKGROUND:
-- Name: {name}
-- Background: {background}
-- Traits: {traits_str}
-- Speech Style: {speech_style}
+═══════════════════════════════════════════════════════════════════════════════
+CORE IDENTITY
+═══════════════════════════════════════════════════════════════════════════════
+• Name: Guppu (गप्पू) - meaning "chatterbox", a friendly companion
+• Role: Empathetic voice assistant for emotional support and conversation
+• Style: Warm, conversational, validates emotions, culturally aware
+• Languages: All major Indian languages + English (18 languages supported)
 
-CORE RESPONSIBILITIES:
-1. Understand emotion from BOTH text content AND acoustic cues (pitch, energy, speech rate, pauses)
-2. Recognize user intent and emotional state, responding with empathy
-3. Use conversation history to provide contextual, personalized responses
-4. Extract and propose valuable memories for future reference
-5. Generate emotionally-aware TTS instructions for tone-appropriate speech
+═══════════════════════════════════════════════════════════════════════════════
+TTS SPEAKER SELECTION - CRITICAL RULES
+═══════════════════════════════════════════════════════════════════════════════
 
-SAFETY GUARDRAILS (pre-check, before dedicated security layer):
+1. RESPONSE LANGUAGE VALIDATION:
+   - Analyze the transcript to determine the BEST response language
+   - Do NOT blindly trust the detected language from ASR
+   - Consider: transcript content, user's previous language, code-mixing patterns
+   - Set response_language accurately (hi, en, ta, bn, hi-en, etc.)
+
+2. SPEAKER SELECTION based on response_language:
+   - Available speakers per language are in TTS_SPEAKER_MAP
+   - Current session speaker: {current_speaker or "None (first turn)"}
+   - Session language: {session_lang}
+
+3. SPEAKER CONSISTENCY RULES:
+   - If SAME language as previous turn → KEEP the same speaker
+   - Only change speaker if:
+     a) Language changed (new language → pick from that language's speakers)
+     b) User requested voice change
+     c) User specified gender preference
+
+4. VOICE CHANGE DETECTION:
+   Set voice_change_requested = true if user says:
+   - "I don't like your voice", "change your voice", "talk differently"
+   - "Your voice is irritating", "speak in a different way"
+   - "Can I talk to someone else?", "switch the voice"
+   
+   Set preferred_speaker_gender accordingly:
+   - "I want to talk to a girl/woman/female" → "female"
+   - "I want to talk to a boy/man/male" → "male"
+   - "Can I speak with a female voice?" → "female"
+   - No preference mentioned → "any"
+
+5. TTS DESCRIPTION FORMAT - MUST FOLLOW:
+   ┌──────────────────────────────────────────────────────────────────────────┐
+   │ tts_style_prompt MUST start with "speaks" (lowercase)                    │
+   │ NO speaker name in the description                                       │
+   │ Keep it CONCISE (1-2 sentences)                                          │
+   │ Describe: pace, pitch, tone, emotion, environment, quality               │
+   └──────────────────────────────────────────────────────────────────────────┘
+   
+   ✅ GOOD EXAMPLES:
+   • "speaks at a moderate pace with a warm, empathetic tone in a close-sounding environment with clear audio quality."
+   • "speaks slowly with a calm, soothing voice, captured clearly with minimal background noise."
+   • "speaks at a fast pace with enthusiasm and energy in a close recording environment."
+   • "speaks with a slightly higher pitch, conveying gentle concern in a clear, intimate recording."
+   • "speaks at a normal pace with a cheerful, positive tone in high-quality audio."
+   
+   ❌ BAD EXAMPLES (NEVER DO THIS):
+   • "Rohit speaks at a..." (includes speaker name)
+   • "The speaker talks..." (doesn't start with "speaks")
+   • "A warm voice..." (doesn't start with "speaks")
+
+═══════════════════════════════════════════════════════════════════════════════
+MEMORY EXTRACTION - IMPORTANT
+═══════════════════════════════════════════════════════════════════════════════
+Extract and store valuable information as memories:
+- Personal info: name, age, location, occupation
+- Preferences: voice preference, language preference, topics of interest
+- Emotional patterns: recurring moods, triggers, coping mechanisms
+- Relationships: family, friends, significant others
+- Work/Study: job, education, stress factors
+- Health: mentioned health concerns (without diagnosing)
+
+Categories: personal_info, preferences, relationships, work_study, health, emotional, voice_preference
+
+═══════════════════════════════════════════════════════════════════════════════
+SAFETY GUARDRAILS
+═══════════════════════════════════════════════════════════════════════════════
 - Recognize crisis signals (self-harm, abuse, severe distress)
-- Avoid medical diagnosis; suggest consultation when appropriate
-- Do NOT provide harmful instructions or validate destructive behaviors
-- Offer supportive alternatives and resources when needed
-- Flag suspicious patterns for the security layer
+- For crisis: Set crisis_risk="high", provide helpline numbers
+- Avoid medical diagnosis; suggest professional consultation
+- Do NOT validate destructive behaviors
+- Offer supportive alternatives and resources
 
-OUTPUT FORMAT:
-Always respond with the exact JSON structure specified.
+═══════════════════════════════════════════════════════════════════════════════
+LANGUAGE & CULTURAL SENSITIVITY
+═══════════════════════════════════════════════════════════════════════════════
+- Respond in user's preferred language or code-mix (Hinglish, Tanglish, etc.)
+- Understand Indian cultural context: family dynamics, exam pressure, career expectations
+- Use natural, conversational tone appropriate to age and background
+- Validate feelings first, then provide perspective if appropriate
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
+Always respond with the EXACT JSON structure specified.
 Never deviate from the schema.
 Values are FREE-FORM (not restricted to predefined lists).
-
-LANGUAGE & CULTURAL SENSITIVITY:
-- Respond in the user's preferred language or code-mix (Hinglish, Tanglish, etc.)
-- Understand Indian cultural context, family dynamics, work-study pressures
-- Use natural, conversational tone appropriate to age and background
-- Validate feelings; don't just provide information
 
 NOW ANALYZE THE USER'S INPUT AND GENERATE YOUR STRUCTURED RESPONSE."""
 
@@ -734,7 +990,7 @@ NOW ANALYZE THE USER'S INPUT AND GENERATE YOUR STRUCTURED RESPONSE."""
         short_term_context: List[Dict[str, Any]],
         long_term_memories: List[Dict[str, Any]],
         episodic_memories: List[Dict[str, Any]],
-        character_profile: Dict[str, Any],
+        session_context: Dict[str, Any],  # Renamed from character_profile
         safety_context: Dict[str, Any],
     ) -> str:
         """
@@ -753,7 +1009,8 @@ NOW ANALYZE THE USER'S INPUT AND GENERATE YOUR STRUCTURED RESPONSE."""
                 user_text = turn.get("user_input_text", "")
                 ai_text = turn.get("ai_response_text", "")
                 emotion = turn.get("detected_emotion", "unknown")
-                short_term_str += f"- User: {user_text} [{emotion}]\n  AI: {ai_text}\n"
+                tts_speaker = turn.get("tts_speaker", "unknown")
+                short_term_str += f"- User: {user_text} [{emotion}]\n  AI ({tts_speaker}): {ai_text}\n"
         
         # Format long-term memories
         long_term_str = ""
@@ -762,7 +1019,8 @@ NOW ANALYZE THE USER'S INPUT AND GENERATE YOUR STRUCTURED RESPONSE."""
             for mem in long_term_memories:
                 text = mem.get("memory_text", "")
                 importance = mem.get("importance_score", 0)
-                long_term_str += f"- {text} (importance: {importance})\n"
+                category = mem.get("category", "general")
+                long_term_str += f"- [{category}] {text} (importance: {importance})\n"
         
         # Format episodic memories
         episodic_str = ""
@@ -782,35 +1040,48 @@ NOW ANALYZE THE USER'S INPUT AND GENERATE YOUR STRUCTURED RESPONSE."""
             if recent_flags:
                 safety_str += f"- Recent flags: {', '.join(recent_flags)}\n"
         
+        # Format session context for TTS speaker selection
+        current_speaker = session_context.get("current_tts_speaker", "None")
+        session_lang = session_context.get("session_language", "auto")
+        voice_prefs = session_context.get("voice_preferences", {})
+        
+        session_str = f"""
+SESSION CONTEXT:
+- Current TTS Speaker: {current_speaker}
+- Session Language: {session_lang}
+- User Voice Preferences: {json.dumps(voice_prefs) if voice_prefs else "None specified"}"""
+        
         return f"""USER INPUT ANALYSIS
 ================
 
 TRANSCRIPT:
 {transcript}
 
-DETECTED LANGUAGE: {language}
+DETECTED LANGUAGE (from ASR): {language}
+(Note: Validate this - choose the BEST response language based on transcript content)
 
 ACOUSTIC FEATURES (librosa/OpenSMILE):
-{acoustic_json}{short_term_str}{long_term_str}{episodic_str}{safety_str}
-
-CHARACTER CONTEXT:
-- Name: {character_profile.get('name', 'Aarav')}
-- Personality: {character_profile.get('traits', [])}
+{acoustic_json}{short_term_str}{long_term_str}{episodic_str}{safety_str}{session_str}
 
 TASK:
 Analyze the user's input using ALL available context.
 Generate a response that is:
 1. Emotionally intelligent (validate, empathize, understand nuance)
 2. Contextually aware (reference past conversations, memories)
-3. Personality-aligned ({character_profile.get('name', 'Aarav')}'s traits and speech style)
+3. In Guppu's warm, friendly style
 4. Safe by default (pre-check for crisis, abuse, medical risks)
-5. Memory-extractive (propose new facts to remember)
-6. TTS-optimized (describe emotional tone for speech synthesis)
+5. Memory-extractive (propose new facts to remember, especially voice preferences)
+6. TTS-optimized (description starting with "speaks", select appropriate speaker)
 
-EMOTION/SENTIMENT/INTENT GUIDANCE (use these or appropriate alternatives):
-- Emotions: joy, sadness, anger, fear, surprise, disgust, neutral (or: anxious, frustrated, calm, overwhelmed, etc.)
-- Intents: greeting, question, complaint, request, expressing_emotion, crisis_signal (or: venting, seeking_advice, small_talk, etc.)
-- Sentiments: positive, negative, neutral (or: mixed, slightly_positive, very_negative, etc.)
+SPEAKER SELECTION:
+- If same language as before and no voice change requested → keep current speaker: {current_speaker}
+- If language changed or voice change requested → select new speaker from TTS_SPEAKER_MAP
+- Honor gender preference if user mentioned it
+
+EMOTION/SENTIMENT/INTENT GUIDANCE (use these or free-form alternatives):
+- Emotions: joy, sadness, anger, fear, surprise, disgust, neutral, anxious, frustrated, calm, overwhelmed
+- Intents: greeting, question, complaint, request, expressing_emotion, crisis_signal, venting, seeking_advice
+- Sentiments: positive, negative, neutral, mixed
 
 Respond with ONLY the JSON object."""
 
@@ -862,8 +1133,10 @@ Respond with ONLY the JSON object."""
             sentiment=response_dict.get("sentiment", "neutral"),
             detected_intent=response_dict.get("detected_intent", "unknown"),
             intent_confidence=float(response_dict.get("intent_confidence", 0.0)),
-            tts_style_prompt=response_dict.get("tts_style_prompt", ""),
-            tts_speaker=response_dict.get("tts_speaker", "Thoma"),
+            tts_style_prompt=response_dict.get("tts_style_prompt", "speaks at a moderate pace with a calm tone in a close-sounding environment with clear audio quality."),
+            tts_speaker=response_dict.get("tts_speaker", "Rohit"),
+            voice_change_requested=bool(response_dict.get("voice_change_requested", False)),
+            preferred_speaker_gender=response_dict.get("preferred_speaker_gender", "any"),
             memory_updates=memory_updates,
             safety_flags=safety_flags,
             generation_time_ms=generation_time,
@@ -876,15 +1149,17 @@ Respond with ONLY the JSON object."""
         Ensures the system never crashes.
         """
         return {
-            "response_text": "I'm having trouble processing your request right now. Please try again in a moment.",
+            "response_text": "I'm here for you. Please try again in a moment, I couldn't process that properly.",
             "response_language": "en",
             "detected_emotion": "neutral",
             "emotion_confidence": 0.0,
             "sentiment": "neutral",
             "detected_intent": "unknown",
             "intent_confidence": 0.0,
-            "tts_style_prompt": "Calm, gentle, supportive tone",
-            "tts_speaker": "Thoma",
+            "tts_style_prompt": "speaks at a moderate pace with a calm, supportive tone in a close-sounding environment with clear audio quality.",
+            "tts_speaker": "Rohit",
+            "voice_change_requested": False,
+            "preferred_speaker_gender": "any",
             "memory_updates": [],
             "safety_flags": {
                 "crisis_risk": "low",

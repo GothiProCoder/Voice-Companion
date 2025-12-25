@@ -233,6 +233,10 @@ class WhisperRequestQueue:
                 
             except Exception as e:
                 logger.error(f"❌ Batch worker error: {e}")
+                # ✅ ADD: Notify all pending requests of the error
+                for request in batch:
+                    if not request.result_future.done():
+                        request.result_future.set_exception(e)
                 await asyncio.sleep(0.1)
     
     async def _collect_batch(self) -> List[TranscriptionRequest]:

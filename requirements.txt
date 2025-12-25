@@ -61,3 +61,12 @@ soundfile
 numpy
 
 langgraph-checkpoint-postgres
+
+fastapi
+uvicorn
+python-multipart
+bcrypt
+httpx
+sseclient-py
+email-validator
+alembic

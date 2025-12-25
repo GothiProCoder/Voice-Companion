@@ -1,3 +1,8 @@
+import sys
+if sys.platform == 'win32':
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
 """
 GuppShupp Conversational AI Workflow - LangGraph-based Agentic System
 ========================================================================
@@ -26,8 +31,8 @@ import logging
 import time
 import threading
 from typing import Dict, List, Optional, Annotated, Any, TypedDict, Literal
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 from enum import Enum
 
@@ -46,6 +51,8 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # ✅ Correct 
 from langchain.agents import AgentState
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.runtime import Runtime
+
+from backend.utils.serialization import sanitize_for_state
 
 # GuppShupp service imports
 from backend.services.whisper_asr import (
@@ -116,7 +123,7 @@ class WorkflowInput(TypedDict):
     user_id: str  # User UUID for memory retrieval and personalization
     session_id: str  # Session UUID for conversation tracking
     conversation_id: Optional[str]  # Current conversation UUID
-    character_profile: Dict[str, Any]  # Aarav personality configuration
+    session_context: Dict[str, Any]  # Contains: current_tts_speaker, session_language, voice_preferences
     request_id: Optional[str]  # For tracing and debugging
 
 
@@ -128,7 +135,7 @@ class WorkflowState(TypedDict):
     user_id: str
     session_id: str
     conversation_id: Optional[str]
-    character_profile: Dict[str, Any]
+    session_context: Dict[str, Any]  # Contains: current_tts_speaker, session_language, voice_preferences
     request_id: str
 
     # Phase 1: Audio Analysis (parallel)
@@ -159,6 +166,10 @@ class WorkflowState(TypedDict):
     tts_response: Optional[TTSResponse]
     tts_error: Optional[str]
     tts_time_ms: int
+    
+    # TTS Speaker Tracking (for session persistence)
+    current_tts_speaker: Optional[str]  # Track the current speaker for session consistency
+    voice_preferences: Dict[str, Any]  # User's voice preferences (gender, etc.)
 
     # Phase 5: Database Persistence (sequential)
     conversation_stored: bool
@@ -239,7 +250,7 @@ class WorkflowServices:
             # Initialize TTS service
             self.tts_service = ParlerTTSService(
                 config=TTSConfig(
-                    modelname="ai4bharat/indic-parler-tts",
+                    model_name="ai4bharat/indic-parler-tts",
                     device="cuda" if torch.cuda.is_available() else "cpu",
                     sampling_rate=44100,
                     cache_enabled=True,
@@ -297,10 +308,21 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
 
     try:
         # Start both tasks in parallel
-        transcription_task = transcribe_audio(state["audio_path"], state["request_id"])
-        prosody_task = extract_prosody_features(
-            state["audio_path"], state["request_id"]
-        )
+        audio_path = str(state["audio_path"])  # Force string
+        
+        # ✅ ADD FILE EXISTENCE CHECK
+        from pathlib import Path
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_path}. "
+                f"File may have been deleted prematurely."
+            )
+        
+        logger.info(f"[DEBUG] Audio file verified: {audio_path} (exists: {audio_file.exists()})")
+        
+        transcription_task = transcribe_audio(audio_path, state["request_id"])
+        prosody_task = extract_prosody_features(audio_path, state["request_id"])
 
         # Wait for both to complete
         transcription, prosody_features = await asyncio.gather(
@@ -338,9 +360,10 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         # Return state updates
+        # ✅ Convert ProsodyResult to dict for msgpack serialization (checkpointer requirement)
         return {
-            "transcription": transcription,
-            "prosody_features": prosody_features,
+            "transcription": sanitize_for_state(transcription),
+            "prosody_features": sanitize_for_state(prosody_features),
             "audio_analysis_error": transcription_error or prosody_error,
             "audio_analysis_time_ms": elapsed_ms,
             "messages": [
@@ -349,6 +372,7 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
                 )
             ],
         }
+
 
     except Exception as e:
         logger.error(f"[PHASE 1] Critical error: {e}", exc_info=True)
@@ -381,14 +405,14 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
             long_term_memories = []
             episodic_memories = []
         else:
-            # Parallel tasks: memory retrieval using semantic search
-            query_text = state["transcription"].text
+            # ⚠️ transcription is now a dict after sanitize_for_state()
+            query_text = state["transcription"].get("text", "")
 
             memory_task = _workflow_services.memory_service.retrieve_memories_async(
                 db=_workflow_services.db_session,
-                userid=state["user_id"],
-                querytext=query_text,
-                topk=5,
+                user_id=state["user_id"],
+                query_text=query_text,
+                top_k=5,
                 memory_types=["long_term", "episodic"],
                 min_importance=0.3,
                 apply_decay=True,
@@ -409,15 +433,32 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
                 state["conversation_id"],
             )
 
+            # ⚠️ CRITICAL FIX: Execute database operations SEQUENTIALLY
+            # SQLAlchemy sessions are NOT thread-safe for concurrent use
+            # The previous asyncio.gather caused "isce" error:
+            # "This session is provisioning a new connection; concurrent operations are not permitted"
+            
+            # Step 1: Get memories (uses db_session)
             try:
-                memories_list, short_term_ctx, conversation = await asyncio.gather(
-                    memory_task, session_context_task, conversation_task
-                )
+                memories_list = await memory_task
             except Exception as e:
-                logger.warning(f"[PHASE 2] Context retrieval error: {e}")
+                logger.warning(f"[PHASE 2] Memory retrieval failed: {e}")
                 memories_list = []
+            
+            # Step 2: Get session context (uses db_session)
+            try:
+                short_term_ctx = await session_context_task
+            except Exception as e:
+                logger.warning(f"[PHASE 2] Session context failed: {e}")
                 short_term_ctx = []
+            
+            # Step 3: Get or create conversation (uses db_session)
+            try:
+                conversation = await conversation_task
+            except Exception as e:
+                logger.warning(f"[PHASE 2] Conversation task failed: {e}")
                 conversation = None
+
 
             # Split memories into long-term and episodic
             long_term_memories = [
@@ -443,7 +484,7 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
                 "user_id": state["user_id"],
                 "session_id": state["session_id"],
                 "conversation_id": state["conversation_id"],
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             },
             "context_prep_error": None,
             "context_prep_time_ms": elapsed_ms,
@@ -483,17 +524,22 @@ async def phase_3_llm_generation_with_guardrails(
 
     try:
         # Build rich context for Gemini
-        acoustic_features = asdict(state["prosody_features"]) if state["prosody_features"] else {}
+        acoustic_features = sanitize_for_state(state.get("prosody_features")) or {}
         
-        # Call Gemini LLM - it handles safety internally with comprehensive guardrails
+        # Build session context with current TTS speaker for consistency
+        session_context = state.get("session_context", {})
+        session_context["current_tts_speaker"] = state.get("current_tts_speaker")
+        session_context["voice_preferences"] = state.get("voice_preferences", {})
+        
+        # ⚠️ transcription is now a dict after sanitize_for_state()
         llm_response = await _workflow_services.llm_service.analyze_and_respond_async(
-            transcript=state["transcription"].text if state["transcription"] else "",
-            language=state["transcription"].language if state["transcription"] else "en",
+            transcript=state["transcription"].get("text", "") if state["transcription"] else "",
+            language=state["transcription"].get("language", "en") if state["transcription"] else "en",
             acoustic_features=acoustic_features,
             short_term_context=state["short_term_context"],
             long_term_memories=state["long_term_memories"],
             episodic_memories=state["episodic_memories"],
-            character_profile=state["character_profile"],
+            session_context=session_context,  # Contains TTS speaker info
             safety_context={},  # Gemini handles this internally
             temperature=config.gemini.temperature,
             max_output_tokens=config.gemini.max_output_tokens,
@@ -505,6 +551,8 @@ async def phase_3_llm_generation_with_guardrails(
             f"[PHASE 3] ✓ LLM response generated ({elapsed_ms}ms): "
             f"emotion={llm_response.detected_emotion}, "
             f"intent={llm_response.detected_intent}, "
+            f"speaker={llm_response.tts_speaker}, "
+            f"voice_change={llm_response.voice_change_requested}, "
             f"memories={len(llm_response.memory_updates)}, "
             f"safety_risk={llm_response.safety_flags.crisis_risk}"
         )
@@ -512,6 +560,11 @@ async def phase_3_llm_generation_with_guardrails(
         # Determine safety action based on Gemini's assessment
         safety_action = "escalate" if llm_response.safety_flags.crisis_risk == "high" else "continue"
         safety_passed = llm_response.safety_flags.crisis_risk != "high"
+        
+        # Update voice preferences if user specified gender
+        voice_preferences = state.get("voice_preferences", {})
+        if llm_response.preferred_speaker_gender != "any":
+            voice_preferences["gender"] = llm_response.preferred_speaker_gender
 
         return {
             "llm_response": llm_response,
@@ -520,6 +573,9 @@ async def phase_3_llm_generation_with_guardrails(
             "safety_action": safety_action,
             "llm_error": None,
             "llm_time_ms": elapsed_ms,
+            # Update TTS speaker for session persistence
+            "current_tts_speaker": llm_response.tts_speaker,
+            "voice_preferences": voice_preferences,
             "messages": [
                 AIMessage(
                     content=f"[Phase 3] LLM generation completed in {elapsed_ms}ms\\n"
@@ -564,19 +620,23 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
 
         # Extract TTS parameters from LLM response
         spoken_text = state["llm_response"].response_text
-        speaker = state["llm_response"].tts_speaker or "Thoma"
-        description = state["llm_response"].tts_style_prompt or "neutral, conversational tone"
+        speaker = state["llm_response"].tts_speaker or "Rohit"
+        tts_style = state["llm_response"].tts_style_prompt or "speaks at a moderate pace with a calm tone in a close-sounding environment with clear audio quality."
+        
+        # Concatenate speaker name with description (LLM generates "speaks..." format)
+        # Result: "Rohit speaks at a moderate pace with..."
+        full_description = f"{speaker} {tts_style}"
 
         logger.info(
             f"[PHASE 4] TTS input: speaker={speaker}, "
-            f"description={description[:50]}..., text_length={len(spoken_text)}"
+            f"description={full_description[:60]}..., text_length={len(spoken_text)}"
         )
 
-        # Create TTS request
+        # Create TTS request with full description
         tts_request = TTSRequest(
             spoken_text=spoken_text,
             speaker=speaker,
-            description=description,
+            description=full_description,  # Now includes speaker name + style
         )
 
         # Generate TTS audio asynchronously
@@ -595,7 +655,15 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
         )
 
         return {
-            "tts_response": tts_response,
+            # ⚠️ CRITICAL: sanitize_for_state converts TTSResponse to dict
+            # This is required because TTSResponse contains numpy.ndarray
+            # which cannot be serialized by LangGraph's MsgPack checkpointer
+            "tts_response": {
+                "audio_base64_wav": tts_response.audio_base64_wav,  # ← Keep audio!
+                "duration_seconds": tts_response.duration_seconds,
+                "sampling_rate": tts_response.sampling_rate,
+                "generation_time_ms": tts_response.generation_time_ms,
+            },
             "tts_error": None,
             "tts_time_ms": elapsed_ms,
             "messages": [
@@ -605,6 +673,7 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
                 )
             ],
         }
+
 
     except Exception as e:
         logger.error(f"[PHASE 4] TTS generation error: {e}", exc_info=True)
@@ -645,32 +714,37 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
 
         # Store conversation
         loop = asyncio.get_event_loop()
-        conversation_stored = await loop.run_in_executor(
+        stored_conversation_id = await loop.run_in_executor(
             None,
             _store_conversation,
             state,
         )
 
+        conversation_stored = stored_conversation_id is not None
+
         if conversation_stored:
             logger.info(f"[PHASE 5] ✓ Conversation stored")
+            # 2. CRITICAL FIX: Update state with the ACTUAL ID so memories link correctly
+            state["conversation_id"] = stored_conversation_id
 
-        # Store memories if LLM proposed any
-        if state["llm_response"].memory_updates:
-            memories_stored = await loop.run_in_executor(
-                None,
-                _store_memories,
-                state,
-            )
-            if memories_stored:
-                logger.info(
-                    f"[PHASE 5] ✓ Stored {len(state['llm_response'].memory_updates)} memories"
+        # Only try to store memories if we have a valid conversation ID to link to
+            if state["llm_response"].memory_updates and stored_conversation_id:
+                memories_stored = await loop.run_in_executor(
+                    None, 
+                    store_memories_with_id,  # New function that takes ID directly
+                    state,
+                    stored_conversation_id  # Pass as argument
                 )
+                if memories_stored:
+                    logger.info(f"[PHASE 5] ✓ Stored memories linked to {stored_conversation_id}")
+            else:
+                logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         return {
             "conversation_stored": conversation_stored,
-            "memories_stored": memories_stored,
+            "memories_stored": memories_stored if 'memories_stored' in locals() else False,
             "db_error": None,
             "db_time_ms": elapsed_ms,
             "messages": [
@@ -734,6 +808,29 @@ def create_workflow_graph(db_session: Session) -> StateGraph:
 # ============================================================================
 # HELPER FUNCTIONS - Supporting utilities for workflow phases
 # ============================================================================
+
+def store_memories_with_id(state: WorkflowState, conversation_id: str) -> bool:
+    """
+    Store memories extracted by LLM with explicit conversation ID.
+    """
+    try:
+        if not state["llm_response"] or not state["llm_response"].memory_updates:
+            return False
+        
+        # Use the passed conversation_id directly - no state lookup
+        stored_memories = _workflow_services.memory_service.store_memories_batch(
+            db=_workflow_services.db_session,
+            user_id=state["user_id"],
+            memory_updates=state["llm_response"].memory_updates,
+            conversation_id=conversation_id,  # Direct argument
+        )
+        
+        logger.info(f"✅ Stored {len(stored_memories)} memories linked to {conversation_id}")
+        return len(stored_memories) > 0
+        
+    except Exception as e:
+        logger.error(f"Failed to store memories: {e}", exc_info=True)
+        return False
 
 
 async def _get_session_context(
@@ -805,7 +902,7 @@ async def _get_or_create_conversation(
                 sentiment="neutral",
                 detected_intent="unknown",
                 intent_confidence=0.0,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc),
             )
             _workflow_services.db_session.add(conv)
             _workflow_services.db_session.commit()
@@ -842,112 +939,104 @@ def _get_fallback_llm_response(error_message: str) -> GeminiLLMResponse:
     )
 
 
-def _store_conversation(state: WorkflowState) -> bool:
+def _store_conversation(state: WorkflowState) -> Optional[str]: # Updated return type
     """
     Store conversation to database with ALL required fields.
-    
-    CRITICAL: Uses IndicBERT to generate semantic embeddings for search.
+    Returns the string UUID of the conversation if successful.
     """
     try:
         if not state["llm_response"] or not state["transcription"]:
             logger.warning("Missing LLM response or transcription - skipping storage")
-            return False
+            return None # Return None instead of False
 
-        # Generate embedding for semantic search using IndicBERT
-        user_text = state["transcription"].text
+        user_text = state["transcription"].get("text", "")
         logger.info(f"Generating IndicBERT embedding for: {user_text[:50]}...")
         embedding = _workflow_services.memory_service.embed_text(user_text, use_cache=False)
-        embedding_list = embedding.tolist()  # Convert numpy to list for pgvector
+        embedding_list = embedding.tolist()
 
-        # Create Conversation object with CORRECT field names
         conversation = Conversation(
             user_id=state["user_id"],
             session_id=state["session_id"],
-            
-            # ✅ CORRECT FIELD NAMES (matching database schema)
             user_input_text=user_text,
             ai_response_text=state["llm_response"].response_text,
-            
-            # Language detection
-            detected_language=state["transcription"].language if state["transcription"] else "en",
+            detected_language=state["transcription"].get("language", "en") if state["transcription"] else "en",
             response_language=state["llm_response"].response_language,
-            is_code_mixed=state["transcription"].is_code_mixed if state["transcription"] else False,
-            code_mix_languages=state["transcription"].detected_languages if state["transcription"] else None,
-            
-            # Emotion & sentiment (from Gemini LLM)
+            is_code_mixed=state["transcription"].get("is_code_mixed", False) if state["transcription"] else False,
+            code_mix_languages=state["transcription"].get("detected_languages") if state["transcription"] else None,
             detected_emotion=state["llm_response"].detected_emotion,
             emotion_confidence=state["llm_response"].emotion_confidence,
             sentiment=state["llm_response"].sentiment,
-            
-            # Intent classification (from Gemini LLM)
             detected_intent=state["llm_response"].detected_intent,
             intent_confidence=state["llm_response"].intent_confidence,
-            
-            # Prosody features (complete JSONB storage)
-            prosody_features=asdict(state["prosody_features"]) if state["prosody_features"] else None,
-            
-            # Audio metadata
-            audio_duration_seconds=state["prosody_features"].meta_info.get("duration_sec", 0)
-            if state["prosody_features"]
-            else 0,
-            audio_file_path=state["audio_path"],
-            response_audio_path=None,  # Will be updated after TTS
-            
-            # TTS generation details
+            prosody_features=state.get("prosody_features"),
+            audio_duration_seconds=(
+                state.get("prosody_features", {})
+                    .get("meta_info", {})
+                    .get("duration_sec", 0.0)
+            ) if state["prosody_features"] else 0,
+            audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
+            response_audio_path=None,
             tts_prompt=state["llm_response"].tts_style_prompt,
-            
-            # Performance metrics
             response_generation_time_ms=state.get("llm_time_ms", 0),
-            
-            # Safety & moderation (from Gemini's safety assessment)
             safety_check_passed=state["llm_response"].safety_flags.crisis_risk != "high",
-            safety_flags=asdict(state["llm_response"].safety_flags),
-            
-            # Timestamp
-            created_at=datetime.utcnow(),
-            
-            # ✅ SEMANTIC EMBEDDING FOR VECTOR SEARCH
+            safety_flags = sanitize_for_state(state["llm_response"].safety_flags),
+            created_at=datetime.now(timezone.utc),
             embedding=embedding_list,
         )
 
         _workflow_services.db_session.add(conversation)
         _workflow_services.db_session.commit()
+        
+        # Refresh to get the ID generated by the DB
+        _workflow_services.db_session.refresh(conversation)
 
         logger.info(
             f"✅ Stored conversation {conversation.id} with embedding "
             f"(emotion={conversation.detected_emotion}, safety={conversation.safety_check_passed})"
         )
-        return True
+        return str(conversation.id) # RETURN THE UUID STRING
 
     except Exception as e:
         logger.error(f"❌ Failed to store conversation: {e}", exc_info=True)
         _workflow_services.db_session.rollback()
-        return False
-
+        return None # Return None instead of False
+    
 
 def _store_memories(state: WorkflowState) -> bool:
-    """Store memories extracted by LLM."""
+    """Store memories extracted by LLM with strict UUID validation."""
     try:
+        # 1. Check if LLM actually proposed any memories
         if not state["llm_response"] or not state["llm_response"].memory_updates:
             return False
 
-        # Convert LLM memory updates to database models with IndicBERT embeddings
+        # 2. CRITICAL FIX: Validate conversation_id type
+        # In previous logs, this was 'True' (bool), which caused the crash.
+        conv_id = state.get("conversation_id")
+        
+        if not conv_id or isinstance(conv_id, bool):
+            logger.error(
+                f"❌ Memory storage aborted: conversation_id is invalid type ({type(conv_id)}). "
+                "Ensure _store_conversation returns a UUID string and not a Boolean."
+            )
+            return False
+
+        # 3. Convert LLM memory updates to database models with IndicBERT embeddings
         stored_memories = _workflow_services.memory_service.store_memories_batch(
             db=_workflow_services.db_session,
-            userid=state["user_id"],
+            user_id=state["user_id"],
             memory_updates=state["llm_response"].memory_updates,
-            conversation_id=state["conversation_id"],
+            conversation_id=conv_id, # Must be a String/UUID
         )
 
-        logger.info(f"Stored {len(stored_memories)} memories")
+        logger.info(f"✅ Stored {len(stored_memories)} memories linked to conversation {conv_id}")
         return len(stored_memories) > 0
 
     except Exception as e:
-        logger.error(f"Failed to store memories: {e}", exc_info=True)
+        logger.error(f"❌ Failed to store memories: {e}", exc_info=True)
+        # Rollback the session to maintain data integrity
         _workflow_services.db_session.rollback()
         return False
-
-
+    
 # ============================================================================
 # PUBLIC API - Workflow execution entry point
 # ============================================================================
@@ -955,7 +1044,7 @@ def _store_memories(state: WorkflowState) -> bool:
 
 async def execute_workflow(
     workflow_input: WorkflowInput,
-    db_session: Session,
+    db_session: Session = None,
 ) -> Dict[str, Any]:
     """
     Execute the complete conversation workflow.
@@ -965,69 +1054,80 @@ async def execute_workflow(
     
     Args:
         workflow_input: User audio + metadata
-        db_session: Database session for persistence
+        db_session: Optional database session (will create one if not provided)
     
     Returns:
         Complete workflow output with all phases and results
     """
-    # Initialize services on first call
-    if not _workflow_services.llm_service:
-        await _workflow_services.initialize_async(db_session)
-
-    # Build initial state
-    initial_state: WorkflowState = {
-        "audio_path": workflow_input["audio_path"],
-        "user_id": workflow_input["user_id"],
-        "session_id": workflow_input["session_id"],
-        "conversation_id": workflow_input.get("conversation_id"),
-        "character_profile": workflow_input.get(
-            "character_profile",
-            {
-                "name": "Aarav",
-                "background": "Empathetic AI companion for Indian youth",
-                "traits": ["empathetic", "culturally aware", "patient"],
-                "speech_style": "conversational, validates emotions",
-            },
-        ),
-        "request_id": workflow_input.get("request_id") or f"req_{int(time.time() * 1000)}",
-        # Phase placeholders
-        "transcription": None,
-        "prosody_features": None,
-        "audio_analysis_error": None,
-        "audio_analysis_time_ms": 0,
-        "long_term_memories": [],
-        "episodic_memories": [],
-        "short_term_context": [],
-        "session_metadata": {},
-        "context_prep_error": None,
-        "context_prep_time_ms": 0,
-        "llm_response": None,
-        "llm_error": None,
-        "llm_time_ms": 0,
-        "safety_flags": None,
-        "safety_passed": False,
-        "safety_action": "continue",
-        "tts_response": None,
-        "tts_error": None,
-        "tts_time_ms": 0,
-        "conversation_stored": False,
-        "memories_stored": False,
-        "db_error": None,
-        "db_time_ms": 0,
-        "messages": [],
-        "total_time_ms": 0,
-        "workflow_status": "pending",
-        "created_at": datetime.utcnow().isoformat(),
-        "completed_at": None,
-    }
-
-    # Execute workflow with proper checkpointer based on environment
-    workflow_start = time.time()
-
+    # Create our own session if not provided
+    from backend.database.database import SessionLocal
+    
+    own_session = False
+    if db_session is None:
+        db_session = SessionLocal()
+        own_session = True
+    
     try:
+        # Initialize services on first call
+        if not _workflow_services.llm_service:
+            await _workflow_services.initialize_async(db_session)
+
+        # Build initial state
+        initial_state: WorkflowState = {
+            "audio_path": str(workflow_input["audio_path"]),
+            "user_id": workflow_input["user_id"],
+            "session_id": workflow_input["session_id"],
+            "conversation_id": workflow_input.get("conversation_id"),
+            "session_context": workflow_input.get(
+                "session_context",
+                {
+                    "current_tts_speaker": None,  # Will be set by LLM
+                    "session_language": "auto",
+                    "voice_preferences": {},
+                },
+            ),
+            "request_id": workflow_input.get("request_id") or f"req_{int(time.time() * 1000)}",
+            # Phase placeholders
+            "transcription": None,
+            "prosody_features": None,
+            "audio_analysis_error": None,
+            "audio_analysis_time_ms": 0,
+            "long_term_memories": [],
+            "episodic_memories": [],
+            "short_term_context": [],
+            "session_metadata": {},
+            "context_prep_error": None,
+            "context_prep_time_ms": 0,
+            "llm_response": None,
+            "llm_error": None,
+            "llm_time_ms": 0,
+            "safety_flags": None,
+            "safety_passed": False,
+            "safety_action": "continue",
+            "tts_response": None,
+            "tts_error": None,
+            "tts_time_ms": 0,
+            # TTS Speaker Tracking (for session persistence)
+            "current_tts_speaker": workflow_input.get("session_context", {}).get("current_tts_speaker"),
+            "voice_preferences": workflow_input.get("session_context", {}).get("voice_preferences", {}),
+            "conversation_stored": False,
+            "memories_stored": False,
+            "db_error": None,
+            "db_time_ms": 0,
+            "messages": [],
+            "total_time_ms": 0,
+            "workflow_status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+
+        # Execute workflow with proper checkpointer based on environment
+        workflow_start = time.time()
+
         logger.info(
             f"Executing workflow {initial_state['request_id']} for user {workflow_input['user_id']}"
         )
+
 
         # Per LangGraph docs: Use context manager for PostgresSaver
         if config.application.environment == "production":
@@ -1035,7 +1135,7 @@ async def execute_workflow(
             # Pattern from knowledge base lines 27501-27538
             async with AsyncPostgresSaver.from_conn_string(config.database.url) as checkpointer:
                 # Optional: Auto-create checkpoint tables (uncomment if needed)
-                await checkpointer.setup()
+                # await checkpointer.setup()
                 
                 # Compile graph with checkpointer inside context manager
                 graph = create_workflow_graph(db_session)
@@ -1109,7 +1209,7 @@ async def execute_workflow(
         total_ms = int((time.time() - workflow_start) * 1000)
         output["total_time_ms"] = total_ms
         output["workflow_status"] = "completed"
-        output["completed_at"] = datetime.utcnow().isoformat()
+        output["completed_at"] = datetime.now(timezone.utc).isoformat()
 
         logger.info(
             f"Workflow {initial_state['request_id']} completed in {total_ms}ms\n"
@@ -1127,9 +1227,16 @@ async def execute_workflow(
         total_ms = int((time.time() - workflow_start) * 1000)
         initial_state["total_time_ms"] = total_ms
         initial_state["workflow_status"] = "failed"
-        initial_state["completed_at"] = datetime.utcnow().isoformat()
+        initial_state["completed_at"] = datetime.now(timezone.utc).isoformat()
         return initial_state
-
+    
+    finally:
+        # Close session if we created it ourselves
+        if own_session and db_session:
+            try:
+                db_session.close()
+            except Exception as e:
+                logger.warning(f"Error closing workflow session: {e}")
 
 # ============================================================================
 # CLI Testing
@@ -1153,13 +1260,19 @@ if __name__ == "__main__":
         # Import SessionLocal AFTER init_database() so it's not None
         from backend.database.database import SessionLocal
         db_session = SessionLocal()
+        
+        from uuid import uuid4
+        
+        user_id = uuid4()
+        session_id = uuid4()
 
         try:
             result = await execute_workflow(
                 workflow_input={
                     "audio_path": audio_file,
-                    "user_id": "test-user-123",
-                    "session_id": "test-session-456",
+                    "user_id": "0c52f2b6-a083-4eef-b956-390c2bc0f542",
+                    "session_id": "3233a928-47ea-4e03-af4e-71328659e8f9",
+
                     "character_profile": {
                         "name": "Aarav",
                         "background": "Empathetic AI companion for Indian youth",
@@ -1201,4 +1314,11 @@ if __name__ == "__main__":
             await _workflow_services.shutdown_async()
             db_session.close()
 
+    # Fix for Windows: psycopg async needs SelectorEventLoop, not ProactorEventLoop
+    import sys
+    if sys.platform == 'win32':
+        import asyncio
+        import selectors
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     asyncio.run(main())

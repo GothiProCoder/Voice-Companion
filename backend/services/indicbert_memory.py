@@ -21,7 +21,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import Session
 from sqlalchemy import text, desc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 from contextlib import contextmanager
@@ -288,8 +288,8 @@ class IndicBERTMemoryService:
                 embedding=embedding_list,
                 access_count=0,
                 is_active=True,
-                created_at=datetime.utcnow(),
-                last_accessed=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                last_accessed=datetime.now(timezone.utc)
             )
             
             # Add to database
@@ -327,18 +327,18 @@ class IndicBERTMemoryService:
         
         Returns:
             List of successfully created Memory objects
-        
-        Example:
-            >>> memory_updates = [
-            ...     MemoryUpdate(type="long_term", text="Fact 1", category="personal", importance=0.8),
-            ...     MemoryUpdate(type="episodic", text="Summary 1", category="emotional", importance=0.7)
-            ... ]
-            >>> memories = service.store_memories_batch(db, user_id, memory_updates)
         """
         if not memory_updates:
             return []
         
         try:
+            # --- UUID TYPE GUARD ---
+            # Fixes: psycopg2.errors.CannotCoerce (boolean to uuid)
+            # If conversation_id is passed as True/False, reset it to None
+            safe_conversation_id = conversation_id
+            if isinstance(conversation_id, bool):
+                safe_conversation_id = None
+            
             # Batch generate embeddings
             texts = [mem.text for mem in memory_updates]
             embeddings = self.embed_batch(texts, show_progress=False)
@@ -354,12 +354,13 @@ class IndicBERTMemoryService:
                     importance_score=memory_update.importance,
                     decay_factor=1.0,
                     is_pinned=False,
-                    source_conversation_id=conversation_id,
+                    # Use the sanitized ID here
+                    source_conversation_id=safe_conversation_id,
                     embedding=embedding.tolist(),
                     access_count=0,
                     is_active=True,
-                    created_at=datetime.utcnow(),
-                    last_accessed=datetime.utcnow()
+                    created_at=datetime.now(timezone.utc),
+                    last_accessed=datetime.now(timezone.utc)
                 )
                 memories.append(memory)
             
@@ -375,7 +376,7 @@ class IndicBERTMemoryService:
             logger.error(f"Failed to store memories in batch: {e}")
             db.rollback()
             return []
-    
+        
     # ========================================================================
     # MEMORY RETRIEVAL (SEMANTIC SEARCH)
     # ========================================================================
@@ -391,78 +392,59 @@ class IndicBERTMemoryService:
         apply_decay: bool = True,
         apply_recency_boost: bool = True
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve most relevant memories using semantic similarity search.
-        
-        Args:
-            db: SQLAlchemy session
-            user_id: User UUID
-            query_text: Text to search against (user's transcript)
-            top_k: Number of memories to return
-            memory_types: Filter by type (e.g., ["long_term", "episodic"])
-            min_importance: Filter memories below this importance score
-            apply_decay: Apply time-based decay factor to ranking
-            apply_recency_boost: Boost recently accessed memories
-        
-        Returns:
-            List of dicts with memory info + similarity score
-        
-        Example:
-            >>> memories = service.retrieve_memories(
-            ...     db=db,
-            ...     user_id=user_id,
-            ...     query_text="मैं बहुत stressed हूँ",
-            ...     top_k=5
-            ... )
-            >>> memories[0]["memory_text"]
-            "User has exam anxiety"
-        """
         try:
-            # Generate query embedding
+            # 1. Generate query embedding
             query_embedding = self.embed_text(query_text, use_cache=False)
             query_embedding_list = query_embedding.tolist()
             
-            # Build SQL query with pgvector cosine similarity
-            # Using <-> operator for cosine distance (1 - cosine_similarity)
+            # 2. Build Base Query
             base_query = db.query(Memory).filter(
                 Memory.user_id == user_id,
                 Memory.is_active == True
             )
             
-            # Apply filters
             if memory_types:
                 base_query = base_query.filter(Memory.memory_type.in_(memory_types))
             
             if min_importance > 0.0:
                 base_query = base_query.filter(Memory.importance_score >= min_importance)
             
-            # Get all matching memories with similarity scores
-            # pgvector cosine distance: embedding <-> query_embedding
-            # Convert to similarity: 1 - distance
+            # 3. Add Similarity Column (returns Tuples of (Memory, float))
             query_with_similarity = base_query.add_columns(
                 (1 - Memory.embedding.cosine_distance(query_embedding_list)).label('similarity')
             )
             
-            # Fetch results
             results = query_with_similarity.all()
             
             if not results:
                 logger.info(f"No memories found for user {user_id}")
                 return []
             
-            # Process results with optional decay and recency boost
             processed_results = []
-            for memory, similarity in results:
+            now = datetime.now(timezone.utc)
+
+            # --- TYPE HINTING FOR VS CODE / PYLANCE ---
+            # We explicitly tell Pylance that 'memory' is a Memory object
+            for row in results:
+                memory: Memory = row[0]
+                similarity: float = float(row[1])
+                
                 # Base score is similarity
-                score = float(similarity)
+                score = similarity
                 
-                # Apply decay factor (time-based fading)
+                # Apply decay factor
                 if apply_decay and not memory.is_pinned:
-                    score *= memory.decay_factor
+                    # Pylance will now recognize .decay_factor
+                    score *= (memory.decay_factor or 1.0)
                 
-                # Apply recency boost (recently accessed memories rank higher)
+                # Apply recency boost
                 if apply_recency_boost and memory.last_accessed:
-                    days_since_access = (datetime.utcnow() - memory.last_accessed).days
+                    # --- TIMEZONE FIX ---
+                    last_acc = memory.last_accessed
+                    if last_acc.tzinfo is None:
+                        last_acc = last_acc.replace(tzinfo=timezone.utc)
+
+                    days_since_access = (now - last_acc).days
                     recency_factor = 1.0 + (0.1 if days_since_access < 7 else 0.0)
                     score *= recency_factor
                 
@@ -480,32 +462,23 @@ class IndicBERTMemoryService:
                     'created_at': memory.created_at,
                     'last_accessed': memory.last_accessed,
                     'access_count': memory.access_count,
-                    'similarity': float(similarity),
+                    'similarity': similarity,
                     'weighted_score': weighted_score,
                     'is_pinned': memory.is_pinned
                 })
             
-            # Sort by weighted score
             processed_results.sort(key=lambda x: x['weighted_score'], reverse=True)
-            
-            # Take top-K
             top_memories = processed_results[:top_k]
             
-            # Update access counts and timestamps (async to avoid blocking)
+            # Update tracking
             memory_ids = [m['memory_id'] for m in top_memories]
             self._update_memory_access(db, memory_ids)
-            
-            logger.info(
-                f"Retrieved {len(top_memories)} memories for user {user_id} "
-                f"(top similarity: {top_memories[0]['similarity']:.3f})"
-            )
             
             return top_memories
         
         except Exception as e:
             logger.error(f"Failed to retrieve memories: {e}")
             return []
-    
     def _update_memory_access(self, db: Session, memory_ids: List[str]) -> None:
         """
         Update access_count and last_accessed for retrieved memories.
@@ -515,7 +488,7 @@ class IndicBERTMemoryService:
             db.query(Memory).filter(Memory.id.in_(memory_ids)).update(
                 {
                     Memory.access_count: Memory.access_count + 1,
-                    Memory.last_accessed: datetime.utcnow()
+                    Memory.last_accessed: datetime.now(timezone.utc)
                 },
                 synchronize_session=False
             )
@@ -587,7 +560,7 @@ class IndicBERTMemoryService:
         """
         try:
             # Update unpinned memories older than 24 hours
-            cutoff_time = datetime.utcnow() - timedelta(hours=24)
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
             
             affected = db.query(Memory).filter(
                 Memory.user_id == user_id,
@@ -718,7 +691,10 @@ class IndicBERTMemoryService:
         user_id: str,
         query_text: str,
         top_k: int = 5,
-        memory_types: Optional[List[str]] = None
+        memory_types: Optional[List[str]] = None,
+        min_importance: float = 0.0,
+        apply_decay: bool = True,
+        apply_recency_boost: bool = True
     ) -> List[Dict[str, Any]]:
         """
         Async wrapper for retrieve_memories (runs in thread pool).
@@ -727,7 +703,7 @@ class IndicBERTMemoryService:
         return await loop.run_in_executor(
             None,
             self.retrieve_memories,
-            db, user_id, query_text, top_k, memory_types
+            db, user_id, query_text, top_k, memory_types, min_importance, apply_decay, apply_recency_boost
         )
     
     # ========================================================================
