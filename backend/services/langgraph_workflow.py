@@ -362,15 +362,12 @@ async def phase_1_audio_analysis(state: WorkflowState) -> Dict[str, Any]:
         # Return state updates
         # ✅ Convert ProsodyResult to dict for msgpack serialization (checkpointer requirement)
         return {
+            **state,  # ← CRITICAL: Keep all previous state
             "transcription": sanitize_for_state(transcription),
             "prosody_features": sanitize_for_state(prosody_features),
             "audio_analysis_error": transcription_error or prosody_error,
             "audio_analysis_time_ms": elapsed_ms,
-            "messages": [
-                AIMessage(
-                    content=f"[Phase 1] Audio analysis completed in {elapsed_ms}ms"
-                )
-            ],
+            "messages": state.get("messages", []) + [AIMessage(content=f"Phase 1: Audio analysis completed in {elapsed_ms}ms")],
         }
 
 
@@ -477,6 +474,7 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         return {
+            **state,  
             "long_term_memories": long_term_memories,
             "episodic_memories": episodic_memories,
             "short_term_context": short_term_ctx if "short_term_ctx" in locals() else [],
@@ -488,11 +486,7 @@ async def phase_2_context_preparation(state: WorkflowState) -> Dict[str, Any]:
             },
             "context_prep_error": None,
             "context_prep_time_ms": elapsed_ms,
-            "messages": [
-                AIMessage(
-                    content=f"[Phase 2] Context preparation completed in {elapsed_ms}ms"
-                )
-            ],
+            "messages": state.get("messages", []) + [AIMessage(content=f"Phase 2: Context preparation completed in {elapsed_ms}ms")],
         }
 
     except Exception as e:
@@ -567,6 +561,7 @@ async def phase_3_llm_generation_with_guardrails(
             voice_preferences["gender"] = llm_response.preferred_speaker_gender
 
         return {
+            **state,
             "llm_response": llm_response,
             "safety_flags": llm_response.safety_flags,  # From Gemini
             "safety_passed": safety_passed,
@@ -576,7 +571,7 @@ async def phase_3_llm_generation_with_guardrails(
             # Update TTS speaker for session persistence
             "current_tts_speaker": llm_response.tts_speaker,
             "voice_preferences": voice_preferences,
-            "messages": [
+            "messages": state.get("messages", []) + [
                 AIMessage(
                     content=f"[Phase 3] LLM generation completed in {elapsed_ms}ms\\n"
                     f"Response: {llm_response.response_text}"
@@ -655,6 +650,7 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
         )
 
         return {
+            **state,
             # ⚠️ CRITICAL: sanitize_for_state converts TTSResponse to dict
             # This is required because TTSResponse contains numpy.ndarray
             # which cannot be serialized by LangGraph's MsgPack checkpointer
@@ -666,7 +662,7 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
             },
             "tts_error": None,
             "tts_time_ms": elapsed_ms,
-            "messages": [
+            "messages": state.get("messages", []) + [
                 AIMessage(
                     content=f"[Phase 4] TTS generation completed in {elapsed_ms}ms\n"
                     f"Duration: {tts_response.duration_seconds:.2f}s"
@@ -723,17 +719,17 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
         conversation_stored = stored_conversation_id is not None
 
         if conversation_stored:
-            logger.info(f"[PHASE 5] ✓ Conversation stored")
+            logger.info(f"[PHASE 5] ✓ Conversation stored: {stored_conversation_id}")
             # 2. CRITICAL FIX: Update state with the ACTUAL ID so memories link correctly
-            state["conversation_id"] = stored_conversation_id
+            # state["conversation_id"] = stored_conversation_id
 
         # Only try to store memories if we have a valid conversation ID to link to
-            if state["llm_response"].memory_updates and stored_conversation_id:
+            if state["llm_response"] and state["llm_response"].memory_updates:
                 memories_stored = await loop.run_in_executor(
                     None, 
-                    store_memories_with_id,  # New function that takes ID directly
+                    _store_memories_with_id,  # New function
                     state,
-                    stored_conversation_id  # Pass as argument
+                    stored_conversation_id  # Pass ID explicitly
                 )
                 if memories_stored:
                     logger.info(f"[PHASE 5] ✓ Stored memories linked to {stored_conversation_id}")
@@ -743,11 +739,13 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         return {
+            **state,
             "conversation_stored": conversation_stored,
             "memories_stored": memories_stored if 'memories_stored' in locals() else False,
+            "conversation_id": stored_conversation_id,  # ← For memory linking
             "db_error": None,
             "db_time_ms": elapsed_ms,
-            "messages": [
+            "messages": state.get("messages", []) + [
                 AIMessage(
                     content=f"[Phase 5] Database persistence completed in {elapsed_ms}ms"
                 )
@@ -809,7 +807,7 @@ def create_workflow_graph(db_session: Session) -> StateGraph:
 # HELPER FUNCTIONS - Supporting utilities for workflow phases
 # ============================================================================
 
-def store_memories_with_id(state: WorkflowState, conversation_id: str) -> bool:
+def _store_memories_with_id(state: WorkflowState, conversation_id: str) -> bool:
     """
     Store memories extracted by LLM with explicit conversation ID.
     """
