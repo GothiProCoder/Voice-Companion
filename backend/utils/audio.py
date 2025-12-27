@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Generator, Union
 from uuid import uuid4
+import numpy as np
+import io
 
 logger = logging.getLogger(__name__)
 
@@ -738,97 +740,167 @@ def temp_audio_context(
 
 
 # =============================================================================
-# AUDIO COMPRESSION FOR DATABASE STORAGE
+# OPUS AUDIO FILE STORAGE (Production)
 # =============================================================================
 
-import gzip
+from pydub import AudioSegment
 
 
-def compress_audio_base64(audio_base64: str) -> str:
+# Audio storage directory (relative to backend root)
+AUDIO_STORAGE_DIR = Path(__file__).parent.parent / "audio_storage"
+
+
+def encode_audio_to_opus(
+    audio_array: np.ndarray,
+    sample_rate: int = 44100,
+    bitrate: str = "48k"
+) -> bytes:
     """
-    Compress audio base64 string using gzip for database storage.
+    Encode raw audio array to Opus format (~95% smaller than WAV).
     
-    Achieves 40-60% size reduction for WAV audio.
+    Pipeline:
+    1. Float32 → Int16 PCM (normalize by ×32767)
+    2. Create pydub AudioSegment
+    3. Export as Opus in OGG container
     
     Args:
-        audio_base64: Original base64-encoded audio string
+        audio_array: NumPy array of audio samples (float32, range -1 to 1)
+        sample_rate: Audio sample rate (default 44100 Hz)
+        bitrate: Opus bitrate (default "48k" for voice quality)
         
     Returns:
-        Compressed base64 string (gzip compressed, then re-encoded as base64)
+        Opus-encoded audio bytes
         
     Example:
-        >>> original = "UklGR..." # 1MB base64 WAV
-        >>> compressed = compress_audio_base64(original)
-        >>> len(compressed) / len(original)  # ~0.45 (55% reduction)
+        >>> audio = model.generate().cpu().numpy().squeeze()
+        >>> opus_bytes = encode_audio_to_opus(audio)
+        >>> len(opus_bytes)  # ~50KB for 10s audio (vs ~1.2MB WAV)
     """
-    if not audio_base64:
-        return ""
+    import numpy as np
     
+    # Ensure float32 and normalize
+    audio_array = audio_array.astype(np.float32)
+    
+    # Clip to valid range
+    audio_array = np.clip(audio_array, -1.0, 1.0)
+    
+    # Convert Float32 → Int16 PCM
+    audio_int16 = (audio_array * 32767).astype(np.int16)
+    
+    # Create AudioSegment from raw bytes
+    segment = AudioSegment(
+        data=audio_int16.tobytes(),
+        sample_width=2,  # 16-bit = 2 bytes
+        frame_rate=sample_rate,
+        channels=1  # Mono
+    )
+    
+    # Export to Opus format
+    buffer = io.BytesIO()
+    segment.export(
+        buffer, 
+        format="opus",
+        codec="libopus",
+        bitrate=bitrate,
+        parameters=["-vbr", "on"]  # Variable bitrate for efficiency
+    )
+    
+    opus_bytes = buffer.getvalue()
+    
+    logger.debug(
+        f"Opus encoding: {len(audio_int16) * 2 // 1024}KB PCM → {len(opus_bytes) // 1024}KB Opus "
+        f"({(1 - len(opus_bytes) / (len(audio_int16) * 2)) * 100:.1f}% reduction)"
+    )
+    
+    return opus_bytes
+
+
+def save_audio_file(
+    audio_bytes: bytes,
+    user_id: str,
+    conversation_id: str,
+    format_ext: str = "opus"
+) -> str:
+    """
+    Save audio bytes to backend storage folder.
+    
+    Storage structure:
+        backend/audio_storage/{user_id}/{conversation_id}.opus
+    
+    Args:
+        audio_bytes: Encoded audio data (Opus bytes)
+        user_id: User UUID string
+        conversation_id: Conversation UUID string
+        format_ext: File extension (default "opus")
+        
+    Returns:
+        Relative path for database storage (e.g., "audio_storage/{user}/{conv}.opus")
+    """
+    # Create user directory if needed
+    storage_dir = AUDIO_STORAGE_DIR / str(user_id)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename
+    filename = f"{conversation_id}.{format_ext}"
+    file_path = storage_dir / filename
+    
+    # Write bytes
+    file_path.write_bytes(audio_bytes)
+    
+    # Return relative path for database
+    relative_path = f"audio_storage/{user_id}/{filename}"
+    
+    logger.info(f"Saved audio file: {relative_path} ({len(audio_bytes) // 1024}KB)")
+    
+    return relative_path
+
+
+def get_audio_file_path(relative_path: str) -> Path:
+    """
+    Get absolute path for audio file from relative database path.
+    
+    Args:
+        relative_path: Path stored in database (e.g., "audio_storage/{user}/{conv}.opus")
+        
+    Returns:
+        Absolute Path object
+    """
+    # relative_path = "audio_storage/{user}/{conv}.opus"
+    # We need to resolve from backend root
+    backend_root = Path(__file__).parent.parent
+    return backend_root / relative_path
+
+
+def delete_audio_file(relative_path: str) -> bool:
+    """
+    Delete audio file from storage (for cleanup/retention policies).
+    
+    Args:
+        relative_path: Path stored in database
+        
+    Returns:
+        True if deleted, False if not found
+    """
     try:
-        # Decode base64 to raw bytes
-        raw_bytes = base64.b64decode(audio_base64)
-        original_size = len(raw_bytes)
-        
-        # Compress with gzip (level 6 = balanced speed/compression)
-        compressed_bytes = gzip.compress(raw_bytes, compresslevel=6)
-        compressed_size = len(compressed_bytes)
-        
-        # Re-encode compressed bytes as base64 for text storage
-        compressed_base64 = base64.b64encode(compressed_bytes).decode("ascii")
-        
-        compression_ratio = (1 - compressed_size / original_size) * 100
-        logger.debug(
-            f"Audio compressed: {original_size // 1024}KB → {compressed_size // 1024}KB "
-            f"({compression_ratio:.1f}% reduction)"
-        )
-        
-        return compressed_base64
-        
+        file_path = get_audio_file_path(relative_path)
+        if file_path.exists():
+            file_path.unlink()
+            logger.info(f"Deleted audio file: {relative_path}")
+            return True
+        return False
     except Exception as e:
-        logger.error(f"Audio compression failed: {e}")
-        # Return original on failure (fallback)
-        return audio_base64
+        logger.error(f"Failed to delete audio file {relative_path}: {e}")
+        return False
+
+
+# Legacy functions - kept for backwards compatibility during migration
+def compress_audio_base64(audio_base64: str) -> str:
+    """DEPRECATED: Use encode_audio_to_opus() instead."""
+    logger.warning("compress_audio_base64 is deprecated - use encode_audio_to_opus()")
+    return audio_base64  # Pass-through
 
 
 def decompress_audio_base64(compressed_base64: str) -> str:
-    """
-    Decompress gzip-compressed audio base64 string.
-    
-    Args:
-        compressed_base64: Gzip-compressed base64 string (from database)
-        
-    Returns:
-        Original base64-encoded audio string
-        
-    Example:
-        >>> compressed = fetch_from_db()
-        >>> original = decompress_audio_base64(compressed)
-        >>> # Now can play: <audio src="data:audio/wav;base64,{original}">
-    """
-    if not compressed_base64:
-        return ""
-    
-    try:
-        # Decode base64 to compressed bytes
-        compressed_bytes = base64.b64decode(compressed_base64)
-        
-        # Decompress gzip
-        raw_bytes = gzip.decompress(compressed_bytes)
-        
-        # Re-encode as base64 for playback
-        original_base64 = base64.b64encode(raw_bytes).decode("ascii")
-        
-        logger.debug(
-            f"Audio decompressed: {len(compressed_bytes) // 1024}KB → {len(raw_bytes) // 1024}KB"
-        )
-        
-        return original_base64
-        
-    except gzip.BadGzipFile:
-        # Not compressed - return as-is (backwards compatibility)
-        logger.debug("Audio not gzip compressed, returning as-is")
-        return compressed_base64
-    except Exception as e:
-        logger.error(f"Audio decompression failed: {e}")
-        return compressed_base64  # Return as-is on failure
-
+    """DEPRECATED: Use get_audio_file_path() instead."""
+    logger.warning("decompress_audio_base64 is deprecated - audio is now stored as files")
+    return compressed_base64  # Pass-through

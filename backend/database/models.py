@@ -122,12 +122,10 @@ class Conversation(Base):
     
     # Audio metadata
     audio_duration_seconds = Column(Float)
-    audio_file_path = Column(Text)
-    response_audio_path = Column(Text)
+    audio_file_path = Column(Text)  # Input audio path
     
-    # TTS audio storage (compressed base64 for reliable playback from history)
-    response_audio_base64 = Column(Text, nullable=True)  # Gzip-compressed base64 WAV
-    audio_is_compressed = Column(Boolean, default=True)  # True = gzip compressed
+    # TTS Response Audio (Opus file storage)
+    response_audio_path = Column(String(500), nullable=True)  # Path to Opus file
     response_audio_duration_seconds = Column(Float, nullable=True)  # Duration for UI
     
     # TTS generation

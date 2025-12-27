@@ -53,7 +53,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langgraph.runtime import Runtime
 
 from backend.utils.serialization import sanitize_for_state
-from backend.utils.audio import compress_audio_base64
+from backend.utils.audio import save_audio_file
 
 # GuppShupp service imports
 from backend.services.whisper_asr import (
@@ -258,6 +258,11 @@ class WorkflowServices:
                 )
             )
             logger.info("✓ Parler TTS service initialized")
+            
+            # ⚡ PHASE 1: Warmup TTS model to pre-compile torch graphs
+            # This eliminates the first-request latency spike (30s → 3s)
+            logger.info("🔥 Warming up TTS model (one-time, may take 20-30s)...")
+            self.tts_service.warmup()
 
             self.db_session = db_session
             logger.info("✓ Database session configured")
@@ -652,11 +657,13 @@ async def phase_4_tts_generation(state: WorkflowState) -> Dict[str, Any]:
 
         return {
             **state,
-            # ⚠️ CRITICAL: sanitize_for_state converts TTSResponse to dict
-            # This is required because TTSResponse contains numpy.ndarray
-            # which cannot be serialized by LangGraph's MsgPack checkpointer
+            # ⚡ CRITICAL: Include audio bytes for Phase 5 file saving
+            # TTSResponse contains numpy arrays which can't be serialized by msgpack,
+            # so we extract only the serializable fields here
             "tts_response": {
-                "audio_base64_wav": tts_response.audio_base64_wav,  # ← Keep audio!
+                "audio_base64_wav": tts_response.audio_base64_wav,  # For frontend playback
+                "audio_opus_bytes": tts_response.audio_opus_bytes,  # ⚡ For Opus mode file saving
+                "audio_wav_bytes": tts_response.audio_wav_bytes,    # ⚡ For WAV mode file saving
                 "duration_seconds": tts_response.duration_seconds,
                 "sampling_rate": tts_response.sampling_rate,
                 "generation_time_ms": tts_response.generation_time_ms,
@@ -734,8 +741,8 @@ async def phase_5_database_persistence(state: WorkflowState) -> Dict[str, Any]:
                 )
                 if memories_stored:
                     logger.info(f"[PHASE 5] ✓ Stored memories linked to {stored_conversation_id}")
-            else:
-                logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
+        else:
+            logger.error("[PHASE 5] Cannot store memories: Conversation save failed (No ID)")
 
         elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -912,6 +919,73 @@ async def _get_or_create_conversation(
         return None
 
 
+def _save_tts_audio_file(
+    tts_response: Optional[dict],
+    user_id: str,
+    session_id: str,
+) -> Optional[str]:
+    """
+    Save TTS audio to file and return relative path for database storage.
+    
+    ⚡ Supports both Opus (compressed) and WAV (fast) based on ENABLE_OPUS_ENCODING config.
+    
+    Args:
+        tts_response: Sanitized TTSResponse dict from workflow state
+        user_id: User UUID string for directory structure
+        session_id: Session UUID for unique filename
+        
+    Returns:
+        Relative path to saved file (e.g., "audio_storage/{user}/{uuid}.wav")
+        None if no audio available
+    """
+    if not tts_response:
+        logger.warning("[AUDIO SAVE] No TTS response provided")
+        return None
+    
+    # Import config to check which format to use
+    from backend.config import config
+    from backend.utils.audio import save_audio_file
+    
+    # Determine which bytes to use based on config
+    if config.audio.enable_opus_encoding:
+        audio_bytes = tts_response.get("audio_opus_bytes")
+        format_ext = "opus"
+        logger.debug("[AUDIO SAVE] Using Opus format (config enabled)")
+    else:
+        audio_bytes = tts_response.get("audio_wav_bytes")
+        format_ext = "wav"
+        logger.debug("[AUDIO SAVE] Using WAV format (Opus disabled)")
+    
+    # Validate we have audio data
+    if not audio_bytes:
+        logger.warning(
+            f"[AUDIO SAVE] No audio bytes found for format '{format_ext}'. "
+            f"Available keys: {list(tts_response.keys())}"
+        )
+        return None
+    
+    # Generate unique filename using UUID
+    import uuid
+    conversation_id = str(uuid.uuid4())
+    
+    try:
+        audio_path = save_audio_file(
+            audio_bytes=audio_bytes,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            format_ext=format_ext  # "opus" or "wav"
+        )
+        logger.info(
+            f"✅ [AUDIO SAVE] Saved TTS audio: {audio_path} "
+            f"({len(audio_bytes) // 1024}KB, format={format_ext})"
+        )
+        return audio_path
+    except Exception as e:
+        logger.error(f"[AUDIO SAVE] Failed to save TTS audio file: {e}", exc_info=True)
+        return None
+
+
+
 
 
 def _get_fallback_llm_response(error_message: str) -> GeminiLLMResponse:
@@ -974,14 +1048,13 @@ def _store_conversation(state: WorkflowState) -> Optional[str]: # Updated return
                     .get("duration_sec", 0.0)
             ) if state["prosody_features"] else 0,
             audio_file_path=str(state["audio_path"]) if state["audio_path"] else None,
-            response_audio_path=None,
             
-            # ⚠️ NEW: Store compressed TTS audio for reliable playback from history
-            response_audio_base64=(
-                compress_audio_base64(state.get("tts_response", {}).get("audio_base64_wav", ""))
-                if state.get("tts_response") else None
+            # ⚡ NEW: Save Opus audio to file, store path in database
+            response_audio_path=_save_tts_audio_file(
+                tts_response=state.get("tts_response"),
+                user_id=str(state["user_id"]),
+                session_id=str(state["session_id"]),
             ),
-            audio_is_compressed=True,  # We always compress now
             response_audio_duration_seconds=(
                 state.get("tts_response", {}).get("duration_seconds", 0.0)
                 if state.get("tts_response") else None

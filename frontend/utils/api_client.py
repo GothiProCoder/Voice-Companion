@@ -615,30 +615,50 @@ class GuppShuppClient:
         data = self._handle_response(response)
         return data
     
-    def get_conversation_audio(self, conversation_id: str) -> Optional[dict]:
+    def get_audio_url(self, conversation_id: str) -> str:
         """
-        Get audio for a specific conversation (on-demand loading).
+        Get the streaming audio URL for a conversation.
         
-        Calls the dedicated /conversations/{id}/audio endpoint.
+        NOTE: This URL requires authentication - use get_conversation_audio() 
+        which handles auth and returns playable base64.
+        """
+        return f"{self.base_url}/conversations/conversations/{conversation_id}/audio"
+    
+    def get_conversation_audio(self, conversation_id: str) -> Optional[str]:
+        """
+        Fetch audio for a conversation and return as base64 for playback.
+        
+        This method handles authentication automatically and returns the audio
+        in a format that st.audio() can play directly.
         
         Args:
             conversation_id: Conversation UUID
             
         Returns:
-            Dict with audio_base64, duration_seconds, or None if not available
+            Base64-encoded audio string ("data:audio/ogg;base64,..."), or None if not available
         """
+        import base64
+        
         try:
             response = self._client.get(
                 f"{self.base_url}/conversations/conversations/{conversation_id}/audio",
-                headers=self._get_headers(),
+                headers=self._get_headers(),  # Include JWT auth token
                 timeout=30.0
             )
             
             if response.status_code == 404:
                 return None
             
-            data = self._handle_response(response)
-            return data
+            if response.status_code != 200:
+                logger.warning(f"Audio fetch failed: {response.status_code}")
+                return None
+            
+            # Convert audio bytes to base64 data URI for st.audio()
+            audio_bytes = response.content
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            
+            # Return as data URI that st.audio() can play directly
+            return f"data:audio/ogg;base64,{audio_b64}"
             
         except Exception as e:
             logger.warning(f"Failed to fetch audio for {conversation_id}: {e}")

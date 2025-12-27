@@ -16,7 +16,7 @@ class FrontendConfig:
     """Frontend configuration settings."""
     
     # Backend API
-    api_base_url: str = os.getenv("API_BASE_URL", "https://f214ea189195.ngrok-free.app")
+    api_base_url: str = os.getenv("API_BASE_URL", "https://534da949ffaf.ngrok-free.app")
     api_version: str = "v1"
     
     # Timeouts

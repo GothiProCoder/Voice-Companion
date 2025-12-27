@@ -625,34 +625,36 @@ def render_messages():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Audio player - On-demand loading
-                audio_b64 = msg.get("audio_base64")
+                # Audio player - On-demand loading (Opus files served via authenticated API)
+                audio_data_uri = msg.get("audio_data_uri")  # Cached data URI
+                audio_b64 = msg.get("audio_base64")  # Legacy base64 (current session)
                 has_audio = msg.get("has_audio", False)
                 conversation_id = msg.get("conversation_id")
                 duration = msg.get("response_duration_seconds")
                 
-                if audio_b64:
-                    # Audio already loaded - show player
-                    logger.info(f"🔊 Rendering audio player: {len(audio_b64)} chars")
+                if audio_data_uri:
+                    # Audio already loaded - play directly
+                    logger.info(f"🔊 Playing cached audio")
+                    st.audio(audio_data_uri)
+                elif audio_b64:
+                    # Legacy base64 (from current session before save)
+                    logger.info(f"🔊 Playing base64 audio: {len(audio_b64)} chars")
                     st.audio(f"data:audio/wav;base64,{audio_b64}")
                 elif has_audio and conversation_id:
-                    # Audio available but not loaded - show load button
+                    # Audio available in storage - show load button
                     duration_str = f" ({duration:.1f}s)" if duration else ""
                     if st.button(f"🔊 Load Audio{duration_str}", key=f"load_audio_{conversation_id}"):
-                        try:
-                            client = get_api_client()
-                            audio_data = client.get_conversation_audio(conversation_id)
-                            if audio_data and audio_data.get("audio_base64"):
-                                # Update message with loaded audio
-                                msg["audio_base64"] = audio_data["audio_base64"]
-                                st.rerun()  # Rerun to show audio player
-                            else:
-                                st.warning("Audio not available")
-                        except Exception as e:
-                            st.error(f"Failed to load audio: {e}")
+                        # Fetch audio with authentication
+                        client = get_api_client()
+                        data_uri = client.get_conversation_audio(conversation_id)
+                        if data_uri:
+                            msg["audio_data_uri"] = data_uri
+                            st.rerun()
+                        else:
+                            st.warning("Audio not available")
                 elif not has_audio:
-                    # No audio for this message (old conversation or TTS failed)
-                    pass  # Don't show anything
+                    # No audio for this message
+                    pass
 
 
 

@@ -820,45 +820,25 @@ async def get_session_conversations(
     # Build response items
     items = []
     for conv in conversations:
-        if include_audio:
-            # Full model - decompress audio if present
-            audio_b64 = None
-            if conv.response_audio_base64:
-                if conv.audio_is_compressed:
-                    audio_b64 = decompress_audio_base64(conv.response_audio_base64)
-                else:
-                    audio_b64 = conv.response_audio_base64
-            
-            items.append(ConversationHistoryItem(
-                id=conv.id,
-                user_input_text=conv.user_input_text,
-                ai_response_text=conv.ai_response_text,
-                detected_emotion=conv.detected_emotion or "neutral",
-                sentiment=conv.sentiment or "neutral",
-                created_at=conv.created_at,
-                has_audio=conv.response_audio_base64 is not None,
-                response_duration_seconds=conv.response_audio_duration_seconds,
-                tts_speaker=None,  # Not stored separately
-                response_audio_base64=audio_b64
-            ))
-        else:
-            # Lightweight tuple result
-            items.append(ConversationHistoryItem(
-                id=conv.id,
-                user_input_text=conv.user_input_text,
-                ai_response_text=conv.ai_response_text,
-                detected_emotion=conv.detected_emotion or "neutral",
-                sentiment=conv.sentiment or "neutral",
-                created_at=conv.created_at,
-                has_audio=conv.has_audio,
-                response_duration_seconds=conv.response_audio_duration_seconds,
-                tts_speaker=None,
-                response_audio_base64=None
-            ))
+        # NEW: Check for audio file path instead of base64
+        has_audio_file = bool(conv.response_audio_path)
+        
+        items.append(ConversationHistoryItem(
+            id=conv.id,
+            user_input_text=conv.user_input_text,
+            ai_response_text=conv.ai_response_text,
+            detected_emotion=conv.detected_emotion or "neutral",
+            sentiment=conv.sentiment or "neutral",
+            created_at=conv.created_at,
+            has_audio=has_audio_file,  # Based on file path existence
+            response_duration_seconds=conv.response_audio_duration_seconds,
+            tts_speaker=None,  # Not stored separately
+            response_audio_base64=None  # DEPRECATED - audio served via /audio/{id} endpoint
+        ))
     
     logger.info(
         f"[{ctx.request_id}] Returned {len(items)} conversations "
-        f"(include_audio={include_audio})"
+        f"(include_audio param ignored - audio served via streaming endpoint)"
     )
     
     return ConversationHistoryResponse(
@@ -887,9 +867,10 @@ async def get_conversation_audio(
     the user clicks play, not when loading the full conversation list.
     
     Returns:
-        JSON with audio_base64 and duration, or 404 if not found
+        Opus audio file stream (audio/ogg MIME type)
     """
-    from backend.utils.audio import decompress_audio_base64
+    from backend.utils.audio import get_audio_file_path
+    from fastapi.responses import FileResponse
     
     # Get conversation with ownership check via session
     conversation = db.query(Conversation).join(
@@ -905,26 +886,35 @@ async def get_conversation_audio(
             detail="Conversation not found"
         )
     
-    if not conversation.response_audio_base64:
+    # Check for audio file path (NEW: file-based storage)
+    if not conversation.response_audio_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No audio available for this conversation"
         )
     
-    # Decompress if needed
-    if conversation.audio_is_compressed:
-        audio_base64 = decompress_audio_base64(conversation.response_audio_base64)
-    else:
-        audio_base64 = conversation.response_audio_base64
+    # Get absolute path to audio file
+    audio_path = get_audio_file_path(conversation.response_audio_path)
     
-    logger.info(f"[{ctx.request_id}] Returned audio for conversation {conversation_id}")
+    if not audio_path.exists():
+        logger.warning(f"Audio file not found: {audio_path}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Audio file not found on disk"
+        )
     
-    return {
-        "conversation_id": str(conversation_id),
-        "audio_base64": audio_base64,
-        "duration_seconds": conversation.response_audio_duration_seconds,
-        "has_audio": True
-    }
+    logger.info(f"[{ctx.request_id}] Streaming audio for conversation {conversation_id}")
+    
+    # Return Opus audio file with proper MIME type
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/ogg",
+        filename=f"{conversation_id}.opus",
+        headers={
+            "Content-Disposition": f"inline; filename={conversation_id}.opus",
+            "Cache-Control": "public, max-age=31536000",  # Cache for 1 year
+        }
+    )
 
 
 # =============================================================================
