@@ -120,6 +120,8 @@ class GuppShuppClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            # Bypass ngrok free tier interstitial page
+            "ngrok-skip-browser-warning": "true",
         }
         if include_auth and self.session_token:
             headers["X-Session-Token"] = self.session_token

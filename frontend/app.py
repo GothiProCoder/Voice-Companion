@@ -457,9 +457,24 @@ def render_sidebar():
         # Sessions list
         st.subheader("💬 Chat Sessions")
         
+        # ✅ CACHE SESSIONS to avoid repeated API calls on every rerun
         try:
-            client = get_api_client()
-            sessions = client.list_sessions(limit=10)
+            import time as _time
+            cache_ttl = 30  # seconds
+            
+            # Initialize cache in session state
+            if "cached_sessions" not in st.session_state:
+                st.session_state.cached_sessions = []
+                st.session_state.sessions_cache_time = 0
+            
+            # Fetch only if cache is stale
+            if _time.time() - st.session_state.sessions_cache_time > cache_ttl:
+                client = get_api_client()
+                st.session_state.cached_sessions = client.list_sessions(limit=10)
+                st.session_state.sessions_cache_time = _time.time()
+                logger.debug("📋 Refreshed sessions cache")
+            
+            sessions = st.session_state.cached_sessions
             
             for session in sessions:
                 session_id = session.get("session_id", "")

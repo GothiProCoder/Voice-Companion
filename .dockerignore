@@ -1,0 +1,12 @@
+# Don't copy these to Docker image
+.env
+*.pyc
+__pycache__/
+.git/
+.gitignore
+README.md
+*.md
+.vscode/
+tests/
+.venv
+tests
